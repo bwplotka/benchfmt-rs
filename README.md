@@ -1,5 +1,8 @@
 # benchfmt
 
+> [!INFO]
+> I'm coming from the Go ecosystem and I can't live without Go's [`benchstat`-- it's too amazing](https://www.bwplotka.dev/2024/go-microbenchmarks-benchstat/). This tooling brings [`golang.org/x/perf/benchfmt`](https://pkg.go.dev/golang.org/x/perf/benchfmt) experience to Rust!
+
 Zero-dependency Rust benchmark runner, heap allocation counter, and Criterion/`libtest` converter emitting Go's [Benchmark Data Format](https://go.googlesource.com/proposal/+/master/design/14313-benchmark-format.md) for direct analysis with [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat).
 
 ## Why this exists
