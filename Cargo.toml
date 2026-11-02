@@ -9,7 +9,15 @@ repository = "https://github.com/bwplotka/benchfmt-rs"
 keywords = ["benchmark", "benchstat", "benchfmt", "performance", "allocations"]
 categories = ["development-tools::profiling", "command-line-utilities"]
 
+[features]
+pprof = ["dep:backtrace", "dep:flate2", "dep:pprof"]
+
 [dependencies]
+backtrace = { version = "0.3", optional = true }
+flate2 = { version = "1.1", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.15", default-features = false, optional = true }
 
 [[bin]]
 name = "benchfmt"

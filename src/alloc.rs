@@ -25,10 +25,16 @@ thread_local! {
 
 #[inline]
 fn record_thread_alloc(bytes: usize) {
+    #[cfg(feature = "pprof")]
+    if crate::pprof_support::is_in_heap_sample() {
+        return;
+    }
     let _ = THREAD_ALLOC_COUNTS.try_with(|cell| {
         let (a, b) = cell.get();
         cell.set((a.wrapping_add(1), b.wrapping_add(bytes as u64)));
     });
+    #[cfg(feature = "pprof")]
+    crate::pprof_support::maybe_record_heap_alloc(bytes);
 }
 
 /// Point-in-time snapshot of cumulative heap allocations on the current thread.
