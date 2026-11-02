@@ -1,0 +1,23 @@
+[package]
+name = "benchfmt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Go benchfmt/benchstat-compatible benchmark harness, allocation counter, and Criterion/libtest converter for Rust"
+license = "Apache-2.0"
+repository = "https://github.com/bwplotka/benchfmt-rs"
+keywords = ["benchmark", "benchstat", "benchfmt", "performance", "allocations"]
+categories = ["development-tools::profiling", "command-line-utilities"]
+
+[dependencies]
+
+[[bin]]
+name = "benchfmt"
+path = "src/bin/benchfmt.rs"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
