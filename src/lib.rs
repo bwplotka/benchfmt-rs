@@ -49,6 +49,7 @@ mod json;
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,10 @@ pub use alloc::{AllocSnapshot, AllocTracker, CountingAlloc};
 pub use convert::{ConvertOptions, convert_criterion_dir, convert_libtest_output};
 
 const MAX_ITERATIONS: u64 = 1_000_000_000;
+
+/// Default Poisson mean byte interval between heap profile samples (`512 KiB`), matching Go's
+/// `runtime.MemProfileRate`.
+pub const DEFAULT_MEM_PROFILE_RATE: usize = 512 * 1024;
 
 /// Target benchmark duration or fixed iteration count (`-benchtime`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,6 +290,13 @@ pub struct BenchConfig {
     pub pkg_override: Option<String>,
     /// List benchmark names without running them (`--list`).
     pub list_only: bool,
+    /// Write a pprof CPU profile to this path (`-cpuprofile`).
+    pub cpu_profile: Option<PathBuf>,
+    /// Write a pprof heap allocation profile to this path (`-memprofile`).
+    pub mem_profile: Option<PathBuf>,
+    /// Mean bytes allocated per heap sample (`-memprofilerate`; `1` samples every allocation, `0`
+    /// disables sampling).
+    pub mem_profile_rate: usize,
 }
 
 impl Default for BenchConfig {
@@ -300,13 +312,17 @@ impl Default for BenchConfig {
             benchmem: false,
             pkg_override: None,
             list_only: false,
+            cpu_profile: None,
+            mem_profile: None,
+            mem_profile_rate: DEFAULT_MEM_PROFILE_RATE,
         }
     }
 }
 
 impl BenchConfig {
-    /// Parses Go-style (`-bench`, `-benchtime`, `-count`, `-cpu`, `-benchmem`) and Cargo-style
-    /// (`--bench`, `--list`, positional filter) CLI flags.
+    /// Parses Go-style (`-bench`, `-benchtime`, `-count`, `-cpu`, `-benchmem`, `-cpuprofile`,
+    /// `-memprofile`, `-memprofilerate`) and Cargo-style (`--bench`, `--list`, positional filter)
+    /// CLI flags.
     pub fn from_args<I, S>(args: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
@@ -364,6 +380,36 @@ impl BenchConfig {
                 cfg.pkg_override = Some(val);
                 continue;
             }
+            if let Some(val) = split_flag(
+                arg,
+                &["-cpuprofile", "--cpuprofile", "-test.cpuprofile"],
+                &mut iter,
+            )? {
+                cfg.cpu_profile = Some(PathBuf::from(val));
+                continue;
+            }
+            if let Some(val) = split_flag(
+                arg,
+                &["-memprofile", "--memprofile", "-test.memprofile"],
+                &mut iter,
+            )? {
+                cfg.mem_profile = Some(PathBuf::from(val));
+                continue;
+            }
+            if let Some(val) = split_flag(
+                arg,
+                &[
+                    "-memprofilerate",
+                    "--memprofilerate",
+                    "-test.memprofilerate",
+                ],
+                &mut iter,
+            )? {
+                cfg.mem_profile_rate = val
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid -memprofilerate {val:?}"))?;
+                continue;
+            }
             if !arg.starts_with('-') && cfg.filter.is_none() {
                 cfg.filter = Some(arg.trim_start_matches("Benchmark").to_owned());
             }
@@ -391,8 +437,27 @@ where
     Ok(None)
 }
 
+/// Scoped profiler notified around the timed portion of each benchmark run.
+///
+/// [`Bencher`] invokes [`Profiler::start_bench`] before recording its allocation baseline and
+/// start timestamp, and invokes [`Profiler::stop_bench`] after recording elapsed time and
+/// allocation deltas so profiler work does not skew `ns/op`, `B/op`, or `allocs/op`.
+pub trait Profiler {
+    /// Starts profiling for a timed `keep_running` window of `bench_name`.
+    fn start_bench(&mut self, bench_name: &str) -> io::Result<()>;
+
+    /// Stops profiling for the current timed window of `bench_name`.
+    fn stop_bench(&mut self, bench_name: &str) -> io::Result<()>;
+
+    /// Flushes any accumulated profile output once all benchmarks finish.
+    fn finish(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Per-epoch state passed to a benchmark closure, mirroring Go's `*testing.B`.
 pub struct Bencher<'a> {
+    bench_name: &'a str,
     target_n: u64,
     remaining: u64,
     started: bool,
@@ -403,15 +468,21 @@ pub struct Bencher<'a> {
     alloc_tracker: Option<&'a dyn AllocTracker>,
     start_alloc: AllocSnapshot,
     alloc_delta: AllocSnapshot,
+    profiler: Option<&'a mut dyn Profiler>,
+    profiler_running: bool,
+    profiler_err: Option<io::Error>,
 }
 
 impl<'a> Bencher<'a> {
     fn new(
+        bench_name: &'a str,
         target_n: u64,
         default_benchmem: bool,
         alloc_tracker: Option<&'a dyn AllocTracker>,
+        profiler: Option<&'a mut dyn Profiler>,
     ) -> Self {
         Self {
+            bench_name,
             target_n,
             remaining: target_n,
             started: false,
@@ -422,6 +493,9 @@ impl<'a> Bencher<'a> {
             alloc_tracker,
             start_alloc: AllocSnapshot::default(),
             alloc_delta: AllocSnapshot::default(),
+            profiler,
+            profiler_running: false,
+            profiler_err: None,
         }
     }
 
@@ -443,6 +517,17 @@ impl<'a> Bencher<'a> {
 
     /// Resets the elapsed timer and allocation baseline, excluding any prior setup work.
     pub fn reset_timer(&mut self) {
+        if self.profiler_running
+            && let Some(prof) = self.profiler.as_deref_mut()
+            && let Err(err) = prof
+                .stop_bench(self.bench_name)
+                .and_then(|()| prof.start_bench(self.bench_name))
+        {
+            self.profiler_running = false;
+            if self.profiler_err.is_none() {
+                self.profiler_err = Some(err);
+            }
+        }
         if let Some(tracker) = self.alloc_tracker {
             self.start_alloc = tracker.snapshot();
         }
@@ -458,6 +543,15 @@ impl<'a> Bencher<'a> {
     pub fn keep_running(&mut self) -> bool {
         if !self.started {
             self.started = true;
+            // NOTE: Start the profiler before capturing allocation and wall-clock baselines so any
+            // profiler initialization cost stays outside the measured benchmark window.
+            if let Some(prof) = self.profiler.as_deref_mut() {
+                if let Err(err) = prof.start_bench(self.bench_name) {
+                    self.profiler_err = Some(err);
+                    return false;
+                }
+                self.profiler_running = true;
+            }
             if let Some(tracker) = self.alloc_tracker {
                 self.start_alloc = tracker.snapshot();
             }
@@ -469,6 +563,16 @@ impl<'a> Bencher<'a> {
             }
             if let Some(tracker) = self.alloc_tracker {
                 self.alloc_delta = self.start_alloc.delta_to(tracker.snapshot());
+            }
+            // NOTE: Stop the profiler only after wall-clock and allocation deltas are recorded.
+            if self.profiler_running {
+                self.profiler_running = false;
+                if let Some(prof) = self.profiler.as_deref_mut()
+                    && let Err(err) = prof.stop_bench(self.bench_name)
+                    && self.profiler_err.is_none()
+                {
+                    self.profiler_err = Some(err);
+                }
             }
             return false;
         }
@@ -492,6 +596,7 @@ pub struct Suite<'a> {
     header: BenchHeader,
     config: BenchConfig,
     alloc_tracker: Option<&'a dyn AllocTracker>,
+    profiler: Option<&'a mut dyn Profiler>,
     benches: Vec<(String, BenchFn<'a>)>,
 }
 
@@ -517,6 +622,7 @@ impl<'a> Suite<'a> {
             header: BenchHeader::detect(pkg),
             config,
             alloc_tracker: None,
+            profiler: None,
             benches: Vec::new(),
         }
     }
@@ -526,6 +632,13 @@ impl<'a> Suite<'a> {
     #[must_use]
     pub fn with_alloc(mut self, tracker: &'a dyn AllocTracker) -> Self {
         self.alloc_tracker = Some(tracker);
+        self
+    }
+
+    /// Attaches a custom [`Profiler`] scoped to the timed portion of each benchmark run.
+    #[must_use]
+    pub fn with_profiler(mut self, profiler: &'a mut dyn Profiler) -> Self {
+        self.profiler = Some(profiler);
         self
     }
 
@@ -548,8 +661,10 @@ impl<'a> Suite<'a> {
     pub fn run(&mut self) {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        self.run_to(&mut handle)
-            .expect("failed writing benchmark output to stdout");
+        if let Err(err) = self.run_to(&mut handle) {
+            eprintln!("benchfmt error: {err}");
+            std::process::exit(1);
+        }
     }
 
     /// Runs all matching benchmarks and writes `benchfmt` output to `out`.
@@ -559,6 +674,13 @@ impl<'a> Suite<'a> {
                 writeln!(out, "Benchmark{name}: benchmark")?;
             }
             return Ok(());
+        }
+
+        if self.config.cpu_profile.is_some() || self.config.mem_profile.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "-cpuprofile and -memprofile require enabling the `pprof` Cargo feature on `benchfmt`",
+            ));
         }
 
         self.header.write(&mut out)?;
@@ -577,11 +699,18 @@ impl<'a> Suite<'a> {
                     self.config.cpu_procs,
                     self.config.benchmem,
                     self.alloc_tracker,
+                    self.profiler
+                        .as_mut()
+                        .map(|p| &mut **p as &mut dyn Profiler),
                     func,
-                );
+                )?;
                 rec.write(&mut out)?;
                 out.flush()?;
             }
+        }
+
+        if let Some(prof) = self.profiler.as_deref_mut() {
+            prof.finish()?;
         }
 
         writeln!(out, "PASS")?;
@@ -595,49 +724,72 @@ fn run_single_epoch<'a>(
     cpu_procs: usize,
     default_benchmem: bool,
     alloc_tracker: Option<&dyn AllocTracker>,
+    mut profiler: Option<&mut dyn Profiler>,
     func: &mut BenchFn<'_>,
-) -> BenchRecord<'a> {
+) -> io::Result<BenchRecord<'a>> {
     let mut n = match benchtime {
         BenchTime::Iterations(fixed) => fixed,
         BenchTime::Duration(_) => 1,
     };
 
     loop {
-        let mut bencher = Bencher::new(n, default_benchmem, alloc_tracker);
-        func(&mut bencher);
-        // Finalize timing if the benchmark body exited early without exhausting `keep_running`.
-        if let Some(started_at) = bencher.start_instant.take() {
-            bencher.elapsed += started_at.elapsed();
-            if let Some(tracker) = bencher.alloc_tracker {
-                bencher.alloc_delta = bencher.start_alloc.delta_to(tracker.snapshot());
+        let (elapsed, bytes_per_op, report_allocs, alloc_delta) = {
+            let mut bencher = Bencher::new(
+                name,
+                n,
+                default_benchmem,
+                alloc_tracker,
+                profiler.as_mut().map(|p| &mut **p as &mut dyn Profiler),
+            );
+            func(&mut bencher);
+            // Finalize timing if the benchmark body exited early without exhausting `keep_running`.
+            if let Some(started_at) = bencher.start_instant.take() {
+                bencher.elapsed += started_at.elapsed();
+                if let Some(tracker) = bencher.alloc_tracker {
+                    bencher.alloc_delta = bencher.start_alloc.delta_to(tracker.snapshot());
+                }
             }
-        }
+            if bencher.profiler_running {
+                bencher.profiler_running = false;
+                if let Some(prof) = bencher.profiler.as_deref_mut()
+                    && let Err(err) = prof.stop_bench(name)
+                    && bencher.profiler_err.is_none()
+                {
+                    bencher.profiler_err = Some(err);
+                }
+            }
+            if let Some(err) = bencher.profiler_err {
+                return Err(err);
+            }
+            (
+                bencher.elapsed,
+                bencher.bytes_per_op,
+                bencher.report_allocs,
+                bencher.alloc_delta,
+            )
+        };
 
         let done = match benchtime {
             BenchTime::Iterations(_) => true,
-            BenchTime::Duration(target) => bencher.elapsed >= target || n >= MAX_ITERATIONS,
+            BenchTime::Duration(target) => elapsed >= target || n >= MAX_ITERATIONS,
         };
 
         if done {
-            let elapsed_ns = bencher.elapsed.as_nanos() as f64;
+            let elapsed_ns = elapsed.as_nanos() as f64;
             let ns_per_op = elapsed_ns / (n as f64);
-            let mb_per_sec = bencher.bytes_per_op.and_then(|bytes| {
+            let mb_per_sec = bytes_per_op.and_then(|bytes| {
                 if elapsed_ns > 0.0 {
                     Some((bytes as f64 * n as f64 * 1_000.0) / elapsed_ns)
                 } else {
                     None
                 }
             });
-            let (alloc_bytes_per_op, allocs_per_op) =
-                if bencher.report_allocs && alloc_tracker.is_some() {
-                    (
-                        Some(bencher.alloc_delta.bytes / n),
-                        Some(bencher.alloc_delta.allocs / n),
-                    )
-                } else {
-                    (None, None)
-                };
-            return BenchRecord {
+            let (alloc_bytes_per_op, allocs_per_op) = if report_allocs && alloc_tracker.is_some() {
+                (Some(alloc_delta.bytes / n), Some(alloc_delta.allocs / n))
+            } else {
+                (None, None)
+            };
+            return Ok(BenchRecord {
                 name,
                 cpu_procs: Some(cpu_procs),
                 iterations: n,
@@ -645,14 +797,14 @@ fn run_single_epoch<'a>(
                 mb_per_sec,
                 alloc_bytes_per_op,
                 allocs_per_op,
-            };
+            });
         }
 
         let target_ns = match benchtime {
             BenchTime::Duration(d) => d.as_nanos(),
             BenchTime::Iterations(_) => unreachable!(),
         };
-        let elapsed_ns = bencher.elapsed.as_nanos();
+        let elapsed_ns = elapsed.as_nanos();
         let next = if let Some(predicted) = target_ns
             .saturating_mul(u128::from(n))
             .checked_div(elapsed_ns)
@@ -685,6 +837,7 @@ mod tests {
             benchmem: false,
             pkg_override: Some("example/pkg".to_owned()),
             list_only: false,
+            ..BenchConfig::default()
         };
         let mut out = Vec::new();
         Suite::with_config("ignored", cfg)
@@ -766,5 +919,106 @@ mod tests {
         assert!(text.contains("BenchmarkParse::promtext"), "{text}");
         assert!(text.contains("1250 ns/op"), "{text}");
         assert!(text.contains("152.10 MB/s"), "{text}");
+    }
+
+    #[test]
+    fn parses_profile_cli_flags() {
+        let cfg = BenchConfig::from_args([
+            "-cpuprofile",
+            "cpu.pb.gz",
+            "-test.memprofile=mem.pb.gz",
+            "--memprofilerate",
+            "4096",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.cpu_profile.as_deref(),
+            Some(std::path::Path::new("cpu.pb.gz"))
+        );
+        assert_eq!(
+            cfg.mem_profile.as_deref(),
+            Some(std::path::Path::new("mem.pb.gz"))
+        );
+        assert_eq!(cfg.mem_profile_rate, 4096);
+    }
+
+    #[test]
+    fn custom_profiler_is_scoped_outside_alloc_and_timing_baselines() {
+        #[derive(Default)]
+        struct RecordingProfiler {
+            events: Vec<String>,
+            scratch: Vec<Vec<u8>>,
+        }
+
+        impl Profiler for RecordingProfiler {
+            fn start_bench(&mut self, bench_name: &str) -> io::Result<()> {
+                self.scratch.push(vec![0u8; 8192]);
+                self.events.push(format!("start:{bench_name}"));
+                Ok(())
+            }
+
+            fn stop_bench(&mut self, bench_name: &str) -> io::Result<()> {
+                self.scratch.push(vec![0u8; 8192]);
+                self.events.push(format!("stop:{bench_name}"));
+                Ok(())
+            }
+
+            fn finish(&mut self) -> io::Result<()> {
+                self.events.push("finish".to_owned());
+                Ok(())
+            }
+        }
+
+        let cfg = BenchConfig {
+            benchtime: BenchTime::Iterations(10),
+            count: 2,
+            cpu_procs: 1,
+            benchmem: true,
+            ..BenchConfig::default()
+        };
+        let mut profiler = RecordingProfiler::default();
+        let mut out = Vec::new();
+        Suite::with_config("pkg", cfg)
+            .with_alloc(&TEST_ALLOC)
+            .with_profiler(&mut profiler)
+            .bench("ScopedWork", |b| {
+                // Allocate 4 KiB outside `keep_running`; neither this nor the profiler's 8 KiB
+                // vectors should appear in `B/op`.
+                let setup = vec![7u8; 4096];
+                while b.keep_running() {
+                    let work = vec![setup[0]; 256];
+                    black_box(work);
+                }
+            })
+            .run_to(&mut out)
+            .unwrap();
+
+        assert_eq!(
+            profiler.events,
+            vec![
+                "start:ScopedWork",
+                "stop:ScopedWork",
+                "start:ScopedWork",
+                "stop:ScopedWork",
+                "finish",
+            ]
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("     256 B/op\t       1 allocs/op"), "{text}");
+    }
+
+    #[test]
+    fn rejects_profile_flags_when_pprof_feature_is_disabled() {
+        let cfg = BenchConfig {
+            benchtime: BenchTime::Iterations(1),
+            mem_profile: Some(PathBuf::from("mem.pb.gz")),
+            ..BenchConfig::default()
+        };
+        let mut out = Vec::new();
+        let err = Suite::with_config("pkg", cfg)
+            .bench("Noop", |b| b.iter(|| 1))
+            .run_to(&mut out)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 }
