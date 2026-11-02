@@ -45,6 +45,10 @@
 mod alloc;
 mod convert;
 mod json;
+#[cfg(feature = "pprof")]
+mod pprof_proto;
+#[cfg(feature = "pprof")]
+mod pprof_support;
 
 use std::fs;
 use std::hint::black_box;
@@ -676,12 +680,16 @@ impl<'a> Suite<'a> {
             return Ok(());
         }
 
+        #[cfg(not(feature = "pprof"))]
         if self.config.cpu_profile.is_some() || self.config.mem_profile.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "-cpuprofile and -memprofile require enabling the `pprof` Cargo feature on `benchfmt`",
             ));
         }
+
+        #[cfg(feature = "pprof")]
+        let mut builtin_pprof = pprof_support::PprofSession::new(&self.config)?;
 
         self.header.write(&mut out)?;
         out.flush()?;
@@ -693,6 +701,29 @@ impl<'a> Suite<'a> {
                 continue;
             }
             for _ in 0..self.config.count {
+                #[cfg(feature = "pprof")]
+                let rec = {
+                    let has_any = builtin_pprof.is_some() || self.profiler.is_some();
+                    let mut combined = pprof_support::CombinedProfiler {
+                        builtin: builtin_pprof.as_mut(),
+                        custom: self
+                            .profiler
+                            .as_mut()
+                            .map(|p| &mut **p as &mut dyn Profiler),
+                    };
+                    let prof_arg: Option<&mut dyn Profiler> =
+                        if has_any { Some(&mut combined) } else { None };
+                    run_single_epoch(
+                        name,
+                        self.config.benchtime,
+                        self.config.cpu_procs,
+                        self.config.benchmem,
+                        self.alloc_tracker,
+                        prof_arg,
+                        func,
+                    )?
+                };
+                #[cfg(not(feature = "pprof"))]
                 let rec = run_single_epoch(
                     name,
                     self.config.benchtime,
@@ -709,6 +740,18 @@ impl<'a> Suite<'a> {
             }
         }
 
+        #[cfg(feature = "pprof")]
+        if builtin_pprof.is_some() || self.profiler.is_some() {
+            let mut combined = pprof_support::CombinedProfiler {
+                builtin: builtin_pprof.as_mut(),
+                custom: self
+                    .profiler
+                    .as_mut()
+                    .map(|p| &mut **p as &mut dyn Profiler),
+            };
+            combined.finish()?;
+        }
+        #[cfg(not(feature = "pprof"))]
         if let Some(prof) = self.profiler.as_deref_mut() {
             prof.finish()?;
         }
@@ -1007,6 +1050,7 @@ mod tests {
         assert!(text.contains("     256 B/op\t       1 allocs/op"), "{text}");
     }
 
+    #[cfg(not(feature = "pprof"))]
     #[test]
     fn rejects_profile_flags_when_pprof_feature_is_disabled() {
         let cfg = BenchConfig {
@@ -1020,5 +1064,193 @@ mod tests {
             .run_to(&mut out)
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(feature = "pprof")]
+    #[inline(never)]
+    fn unmeasured_setup_alloc_helper(size: usize) -> Vec<u8> {
+        vec![9u8; size]
+    }
+
+    #[cfg(feature = "pprof")]
+    #[inline(never)]
+    fn tracked_heap_alloc_helper(size: usize) -> Vec<u8> {
+        vec![42u8; size]
+    }
+
+    #[cfg(feature = "pprof")]
+    #[inline(never)]
+    fn cpu_burn_helper(rounds: u64) -> u64 {
+        let mut acc = 1u64;
+        for i in 0..rounds {
+            acc = acc.wrapping_mul(6364136223846793005).wrapping_add(i | 1);
+            black_box(acc);
+        }
+        acc
+    }
+
+    #[cfg(feature = "pprof")]
+    #[test]
+    fn writes_scoped_mem_and_cpu_pprof_profiles() {
+        use std::io::Read;
+
+        let dir = std::env::temp_dir().join(format!("benchfmt_pprof_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mem_path = dir.join("mem.pb.gz");
+        let cpu_path = dir.join("cpu.pb.gz");
+
+        let cfg = BenchConfig {
+            benchtime: BenchTime::Iterations(40),
+            count: 1,
+            cpu_procs: 1,
+            benchmem: true,
+            #[cfg(unix)]
+            cpu_profile: Some(cpu_path.clone()),
+            mem_profile: Some(mem_path.clone()),
+            // Sample every allocation so deterministic assertions hold on small iteration counts.
+            mem_profile_rate: 1,
+            ..BenchConfig::default()
+        };
+
+        let mut out = Vec::new();
+        Suite::with_config("pprof_test", cfg)
+            .with_alloc(&TEST_ALLOC)
+            .bench("BurnAndAlloc", |b| {
+                // Unmeasured setup allocation must not appear in `B/op` or `mem.pb.gz`.
+                let unmeasured_setup = unmeasured_setup_alloc_helper(65_536);
+                black_box(&unmeasured_setup);
+                while b.keep_running() {
+                    black_box(tracked_heap_alloc_helper(2048));
+                    black_box(cpu_burn_helper(250_000));
+                }
+            })
+            .run_to(&mut out)
+            .unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("    2048 B/op\t       1 allocs/op"),
+            "profiler internal allocations leaked into benchfmt output:\n{text}"
+        );
+
+        let mem_gz = fs::read(&mem_path).unwrap();
+        assert_eq!(&mem_gz[..2], &[0x1f, 0x8b], "expected gzip magic header");
+        let mut mem_raw = Vec::new();
+        flate2::read::GzDecoder::new(&mem_gz[..])
+            .read_to_end(&mut mem_raw)
+            .unwrap();
+        let mem_lossy = String::from_utf8_lossy(&mem_raw);
+        assert!(mem_lossy.contains("alloc_space"), "{mem_lossy}");
+        assert!(
+            mem_lossy.contains("tracked_heap_alloc_helper"),
+            "expected symbolicated helper in memprofile"
+        );
+        assert!(
+            !mem_lossy.contains("unmeasured_setup_alloc_helper"),
+            "setup allocations outside keep_running leaked into memprofile"
+        );
+
+        #[cfg(unix)]
+        {
+            let cpu_gz = fs::read(&cpu_path).unwrap();
+            assert_eq!(&cpu_gz[..2], &[0x1f, 0x8b], "expected gzip magic header");
+            let mut cpu_raw = Vec::new();
+            flate2::read::GzDecoder::new(&cpu_gz[..])
+                .read_to_end(&mut cpu_raw)
+                .unwrap();
+            let cpu_lossy = String::from_utf8_lossy(&cpu_raw);
+            assert!(cpu_lossy.contains("nanoseconds"), "{cpu_lossy}");
+            assert!(
+                cpu_lossy.contains("cpu_burn_helper"),
+                "expected symbolicated helper in cpuprofile"
+            );
+        }
+
+        if let Ok(go_ver) = std::process::Command::new("go").arg("version").output()
+            && go_ver.status.success()
+        {
+            let mem_top = std::process::Command::new("go")
+                .args(["tool", "pprof", "-top", mem_path.to_str().unwrap()])
+                .output()
+                .unwrap();
+            let mem_stdout = String::from_utf8_lossy(&mem_top.stdout);
+            let mem_stderr = String::from_utf8_lossy(&mem_top.stderr);
+            assert!(
+                mem_top.status.success(),
+                "go tool pprof failed on memprofile:\nstdout:\n{mem_stdout}\nstderr:\n{mem_stderr}"
+            );
+            assert!(
+                mem_stdout.contains("tracked_heap_alloc_helper"),
+                "go tool pprof -top missing tracked_heap_alloc_helper:\n{mem_stdout}"
+            );
+
+            #[cfg(unix)]
+            {
+                let cpu_top = std::process::Command::new("go")
+                    .args(["tool", "pprof", "-top", cpu_path.to_str().unwrap()])
+                    .output()
+                    .unwrap();
+                let cpu_stdout = String::from_utf8_lossy(&cpu_top.stdout);
+                let cpu_stderr = String::from_utf8_lossy(&cpu_top.stderr);
+                assert!(
+                    cpu_top.status.success(),
+                    "go tool pprof failed on cpuprofile:\nstdout:\n{cpu_stdout}\nstderr:\n{cpu_stderr}"
+                );
+                assert!(
+                    cpu_stdout.contains("cpu_burn_helper"),
+                    "go tool pprof -top missing cpu_burn_helper:\n{cpu_stdout}"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "pprof")]
+    #[test]
+    fn poisson_memprofile_sampling_scales_allocations() {
+        use std::io::Read;
+
+        let dir =
+            std::env::temp_dir().join(format!("benchfmt_pprof_poisson_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mem_path = dir.join("poisson_mem.pb.gz");
+
+        let cfg = BenchConfig {
+            benchtime: BenchTime::Iterations(1_000),
+            count: 1,
+            cpu_procs: 1,
+            benchmem: true,
+            mem_profile: Some(mem_path.clone()),
+            mem_profile_rate: 16 * 1024,
+            ..BenchConfig::default()
+        };
+
+        let mut out = Vec::new();
+        Suite::with_config("pprof_poisson", cfg)
+            .with_alloc(&TEST_ALLOC)
+            .bench("PoissonAlloc", |b| {
+                while b.keep_running() {
+                    black_box(tracked_heap_alloc_helper(1024));
+                }
+            })
+            .run_to(&mut out)
+            .unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("    1024 B/op\t       1 allocs/op"), "{text}");
+
+        let mem_gz = fs::read(&mem_path).unwrap();
+        let mut mem_raw = Vec::new();
+        flate2::read::GzDecoder::new(&mem_gz[..])
+            .read_to_end(&mut mem_raw)
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&mem_raw).contains("tracked_heap_alloc_helper"),
+            "expected sampled stack in Poisson memprofile"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
