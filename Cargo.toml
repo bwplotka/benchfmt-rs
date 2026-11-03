@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Go benchfmt/benchstat-compatible benchmark harness, allocation counter, and Criterion/libtest converter for Rust"
 license = "Apache-2.0"
-repository = "https://github.com/bwplotka/benchfmt-rs"
+repository = "https://github.com/bwplotka/benchfmt.rs"
 keywords = ["benchmark", "benchstat", "benchfmt", "performance", "allocations"]
 categories = ["development-tools::profiling", "command-line-utilities"]
 
