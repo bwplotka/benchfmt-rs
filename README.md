@@ -2,6 +2,8 @@
 
 👋 I'm coming from the Go ecosystem and I can't live without Go's [`benchstat`-- it's too amazing](https://www.bwplotka.dev/2024/go-microbenchmarks-benchstat/). This repo brings solid benchmarking practices and experience from [`golang.org/x/perf/benchfmt`](https://pkg.go.dev/golang.org/x/perf/benchfmt) to Rust!
 
+See [`benchfmt.rs: Bringing Go's Benchmarking and benchstat Workflow to Rust`](https://www.bwplotka.dev/2026/rust-microbenchmarks-benchstat/) blog post for deeper explanation and fun Go vs Rust learnings.
+
 ### What this repo contains?
 
 1. `Criterion`/`libtest` converter emitting Go's [Benchmark Data Format](https://go.googlesource.com/proposal/+/master/design/14313-benchmark-format.md) for direct analysis with [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat).
