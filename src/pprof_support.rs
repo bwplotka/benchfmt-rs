@@ -237,10 +237,12 @@ fn xorshift64_star(state: &mut u64) -> u64 {
 
 /// Built-in [`Profiler`] session managing `-cpuprofile` and `-memprofile` across a [`crate::Suite`].
 pub(crate) struct PprofSession {
-    _lock: MutexGuard<'static, ()>,
     #[cfg(unix)]
     cpu: Option<CpuCollector>,
     mem: Option<MemCollector>,
+    // Keep `_lock` as the last field so `cpu` (`ProfilerGuard`) and `mem` are always dropped
+    // before `SESSION_LOCK` is released.
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl PprofSession {
@@ -285,10 +287,10 @@ impl PprofSession {
         };
 
         Ok(Some(Self {
-            _lock: lock,
             #[cfg(unix)]
             cpu,
             mem,
+            _lock: lock,
         }))
     }
 }
@@ -296,6 +298,11 @@ impl PprofSession {
 impl Drop for PprofSession {
     fn drop(&mut self) {
         HEAP_SAMPLE_RATE.store(0, Ordering::Release);
+        #[cfg(unix)]
+        {
+            self.cpu = None;
+        }
+        self.mem = None;
         if let Ok(mut guard) = HEAP_SAMPLES.lock() {
             *guard = None;
         }
@@ -462,22 +469,21 @@ impl MemCollector {
 /// from the leaf of a heap sample while preserving user functions into which `alloc::alloc::*`
 /// was inlined (such as `Box::new` under `--release` with `debug = 1`).
 fn strip_internal_heap_frames(frame_symbols: &mut Vec<(u64, Vec<ResolvedSymbol>)>) {
-    let first_symbolicated_is_internal = frame_symbols
-        .iter()
-        .find(|(_, syms)| !syms.is_empty())
-        .is_some_and(|(_, syms)| syms.iter().any(is_internal_heap_frame));
-
+    let mut idx = 0usize;
     let mut skip = 0usize;
-    if first_symbolicated_is_internal {
-        while skip < frame_symbols.len() && frame_symbols[skip].1.is_empty() {
-            skip += 1;
+    while idx < frame_symbols.len() {
+        let syms = &frame_symbols[idx].1;
+        if syms.is_empty() {
+            idx += 1;
+        } else if syms.iter().all(is_internal_heap_frame) {
+            idx += 1;
+            skip = idx;
+        } else {
+            if syms.iter().any(is_internal_heap_frame) {
+                skip = idx;
+            }
+            break;
         }
-    }
-    while skip < frame_symbols.len()
-        && !frame_symbols[skip].1.is_empty()
-        && frame_symbols[skip].1.iter().all(is_internal_heap_frame)
-    {
-        skip += 1;
     }
     if skip > 0 && skip < frame_symbols.len() {
         frame_symbols.drain(..skip);
@@ -772,7 +778,9 @@ mod tests {
             lineno: 1,
         };
         let mut frames = vec![
-            // Unsymbolicated `_Unwind_Backtrace` leaf frame in stripped `libgcc_s`.
+            // Symbolicated leaf unwinder frame followed by an unsymbolicated `_Unwind_Backtrace`
+            // frame in stripped `libgcc_s`.
+            (0x0fff, vec![mk("backtrace::backtrace::libunwind::trace")]),
             (0x1000, Vec::new()),
             // Internal wrapper frames.
             (
@@ -804,5 +812,18 @@ mod tests {
         assert_eq!(frames[0].1.len(), 2);
         assert_eq!(frames[0].1[0].name, "alloc::boxed::Box<T>::new");
         assert_eq!(frames[0].1[1].name, "my_crate::my_box_alloc_fn");
+
+        // Leading unsymbolicated user frames are preserved when not followed by internal frames.
+        let mut user_unsymbolicated = vec![(0x4000, Vec::new()), (0x5000, vec![mk("my_crate::f")])];
+        strip_internal_heap_frames(&mut user_unsymbolicated);
+        assert_eq!(user_unsymbolicated.len(), 2);
+
+        // All-internal stacks are never drained to empty.
+        let mut all_internal = vec![(
+            0x1001,
+            vec![mk("benchfmt::pprof_support::capture_heap_sample")],
+        )];
+        strip_internal_heap_frames(&mut all_internal);
+        assert_eq!(all_internal.len(), 1);
     }
 }
