@@ -29,7 +29,7 @@ Comparing Rust changes across commits or benchmarking Rust implementations side 
 | External Rust crates | `0` by default on `std`, optional `pprof` feature | `0` in CLI, Criterion in `dev-dependencies` | ~40+ crates |
 | Sampling model | `-count` independent calibrated epochs for fixed `-benchtime`, e.g. `6 x 2s` | 100 linear-ramp samples bucketed into `--epochs`, `6` by default | 100 linear-ramp or flat samples |
 | Fit for `benchstat` Mann-Whitney U | Exact, each epoch is an independent steady-state run | Approximate, early buckets average shorter cold runs and later buckets average longer warm runs | N/A, uses Criterion's own t-test and bootstrap |
-| Heap allocations | `B/op` and `allocs/op` via `CountingAlloc` | Not recorded | Not recorded |
+| Heap allocations | `B/op` and `allocs/op` via `CountingAlloc` or `ProcessAlloc` | Not recorded | Not recorded |
 | Profiling | Optional `-cpuprofile` and `-memprofile` pprof flags plus `Profiler` trait | None | External `pprof` or custom `Profiler` adapter |
 | Throughput unit | Decimal `MB/s` at `1e6` bytes/s, matching Go `testing.B` | Converts `Throughput::Bytes` to decimal `MB/s` | Decimal `MB/s` or binary `MiB/s` |
 | Multi-run comparison | `benchstat -col /dim` across arbitrary files, commits, and Go vs. Rust | `benchstat -col /dim` via `full_id` | Pairwise `base` vs. `new` directory |
@@ -82,6 +82,15 @@ fn main() {
         })
         .run();
 }
+```
+
+For multi-threaded benchmarks where iterations dispatch work onto worker threads (such as a Tokio runtime or Rayon pool), replace `CountingAlloc` with `ProcessAlloc` so allocations across all threads are counted in `B/op` and `allocs/op`:
+
+```rust
+use benchfmt::{ProcessAlloc, Suite};
+
+#[global_allocator]
+static ALLOC: ProcessAlloc = ProcessAlloc::new();
 ```
 
 Run with Go-compatible flags and compare with `benchstat`:
