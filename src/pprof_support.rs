@@ -662,6 +662,7 @@ impl CpuCollector {
             }
             let mut frame_symbols = Vec::with_capacity(unresolved.frames.len());
             let mut frame_iter = unresolved.frames.iter();
+            let mut next_is_interrupted_pc = false;
             while let Some(frame) = frame_iter.next() {
                 #[cfg(all(
                     target_os = "macos",
@@ -686,13 +687,20 @@ impl CpuCollector {
                 if ip == 0 {
                     continue;
                 }
+                // The single frame unwound across the OS signal trampoline (`__restore_rt`) holds
+                // the exact interrupted `PC` rather than a post-`call` return address; add 1 before
+                // `backtrace::resolve` (which subtracts 1 internally) and store `ip` directly.
+                let exact_pc = std::mem::take(&mut next_is_interrupted_pc);
+                let lookup_ip = if exact_pc { ip.saturating_add(1) } else { ip };
                 let syms = resolved_cache
-                    .entry(ip)
-                    .or_insert_with(|| resolve_return_ip(ip, (sym_addr != 0).then_some(sym_addr)))
+                    .entry(lookup_ip)
+                    .or_insert_with(|| {
+                        resolve_return_ip(lookup_ip, (sym_addr != 0).then_some(sym_addr))
+                    })
                     .clone();
 
                 // Strip `pprof`'s `SIGPROF` handler, any unwinder frames captured above it, and
-                // the OS signal trampoline frame immediately below it (`_sigtramp` on macOS).
+                // the OS signal return trampoline frame immediately below it (`__restore_rt`).
                 if syms.iter().any(|sym| {
                     matches!(
                         sym.name.as_str(),
@@ -704,10 +712,16 @@ impl CpuCollector {
                 }) {
                     frame_symbols.clear();
                     frame_iter.next();
+                    next_is_interrupted_pc = true;
                     continue;
                 }
 
-                frame_symbols.push((ip.saturating_sub(1) as u64, syms));
+                let loc_addr = if exact_pc {
+                    ip as u64
+                } else {
+                    ip.saturating_sub(1) as u64
+                };
+                frame_symbols.push((loc_addr, syms));
             }
 
             let mut loc_ids = Vec::with_capacity(frame_symbols.len());
@@ -856,5 +870,22 @@ mod tests {
         )];
         strip_internal_heap_frames(&mut all_internal);
         assert_eq!(all_internal.len(), 1);
+    }
+
+    #[inline(never)]
+    fn interrupted_entry_probe(x: u64) -> u64 {
+        std::hint::black_box(x).wrapping_add(1)
+    }
+
+    #[test]
+    fn exact_pc_plus_one_resolves_function_entry_byte() {
+        assert_eq!(interrupted_entry_probe(41), 42);
+        let entry_pc = interrupted_entry_probe as *const () as usize;
+        let syms = resolve_return_ip(entry_pc.saturating_add(1), None);
+        assert!(
+            syms.iter()
+                .any(|s| s.name.contains("interrupted_entry_probe")),
+            "expected function entry byte to resolve to interrupted_entry_probe, got {syms:?}"
+        );
     }
 }
