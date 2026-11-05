@@ -189,6 +189,32 @@ mod tests {
         assert!(run_with(["libtest", "--tag", "IMPL=rust"], &b""[..], Vec::new()).is_err());
         assert!(run_with(["unknown"], &b""[..], Vec::new()).is_err());
         assert!(run_with(["libtest", "--bogus"], &b""[..], Vec::new()).is_err());
+        assert!(run_with(["libtest", "a", "b"], &b""[..], Vec::new()).is_err());
         assert!(run_with::<[&str; 0], _, _, _>([], &b""[..], Vec::new()).is_err());
+
+        let tmp = std::env::temp_dir().join(format!("benchfmt_cli_test_{}", std::process::id()));
+        let base_dir = tmp.join("Grp/base");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::write(base_dir.join("benchmark.json"), r#"{"full_id":"Grp/k=1"}"#).unwrap();
+        fs::write(
+            base_dir.join("sample.json"),
+            r#"{"iters":[1.0,2.0],"times":[10.0,20.0]}"#,
+        )
+        .unwrap();
+        let mut crit_out = Vec::new();
+        run_with(
+            [
+                "criterion",
+                tmp.to_str().unwrap(),
+                "--epochs=1",
+                "--baseline=base",
+            ],
+            &b""[..],
+            &mut crit_out,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+        let crit_text = String::from_utf8(crit_out).unwrap();
+        assert!(crit_text.contains("BenchmarkGrp/k=1\t"), "{crit_text}");
     }
 }
