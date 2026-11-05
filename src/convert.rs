@@ -185,14 +185,7 @@ fn collect_criterion_benchmarks(
                 continue;
             }
         }
-        // Skip Criterion's generated HTML `report/index.html` tree while still traversing user
-        // benchmark groups named `report`.
-        let is_html_report = path.file_name().and_then(|s| s.to_str()) == Some("report")
-            && path.join("index.html").is_file()
-            && !path.join(baseline).is_dir();
-        if !is_html_report {
-            collect_criterion_benchmarks(&path, baseline, out)?;
-        }
+        collect_criterion_benchmarks(&path, baseline, out)?;
     }
     Ok(())
 }
@@ -263,11 +256,11 @@ mod tests {
         let tmp =
             std::env::temp_dir().join(format!("benchfmt_convert_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
-        // Benchmark group literally named `report` plus Criterion's HTML `report/index.html`.
-        let group_dir = tmp.join("report/base");
-        let html_dir = tmp.join("other/report");
+        // Benchmark group literally named `report` containing both Criterion's HTML
+        // `report/index.html` and a nested `report/case_1/base` sub-benchmark.
+        let group_dir = tmp.join("report/case_1/base");
+        let html_dir = tmp.join("report");
         fs::create_dir_all(&group_dir).unwrap();
-        fs::create_dir_all(&html_dir).unwrap();
         fs::write(html_dir.join("index.html"), "<html></html>").unwrap();
 
         fs::write(
