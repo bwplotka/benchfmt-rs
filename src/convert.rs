@@ -148,7 +148,7 @@ pub fn convert_criterion_dir(
             let rec = BenchRecord {
                 name: &name,
                 cpu_procs: opts.cpu_procs,
-                iterations: sum_iters.round() as u64,
+                iterations: (sum_iters.round() as u64).clamp(1, i64::MAX as u64),
                 ns_per_op,
                 mb_per_sec,
                 alloc_bytes_per_op: None,

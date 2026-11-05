@@ -89,8 +89,8 @@ impl BenchTime {
             let n = iters
                 .parse::<u64>()
                 .map_err(|_| format!("invalid iteration benchtime {raw:?}"))?;
-            if n == 0 {
-                return Err("iteration benchtime must be >= 1".to_owned());
+            if n == 0 || n > i64::MAX as u64 {
+                return Err("iteration benchtime must be in 1..=i64::MAX".to_owned());
             }
             return Ok(Self::Iterations(n));
         }
@@ -185,18 +185,33 @@ impl BenchHeader {
         }
     }
 
-    /// Writes the configuration block in `benchfmt` format.
-    ///
-    /// Returns [`io::ErrorKind::InvalidInput`] if any header key violates Go's `benchfmt` key
-    /// grammar (lowercase start, no uppercase/whitespace/colons) or any value contains newlines or
-    /// is empty.
-    pub fn write(&self, mut out: impl Write) -> io::Result<()> {
+    fn validate(&self) -> io::Result<()> {
         validate_header_kv("goos", &self.goos)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         validate_header_kv("goarch", &self.goarch)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         validate_header_kv("pkg", &self.pkg)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if let Some(cpu) = &self.cpu {
+            let trimmed_cpu = cpu.trim();
+            if !trimmed_cpu.is_empty() {
+                validate_header_kv("cpu", trimmed_cpu)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            }
+        }
+        for (k, v) in &self.extra {
+            validate_header_kv(k, v).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        }
+        Ok(())
+    }
+
+    /// Writes the configuration block in `benchfmt` format.
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any header key violates Go's `benchfmt` key
+    /// grammar (lowercase start, no uppercase/whitespace/colons) or any value contains newlines or
+    /// is empty.
+    pub fn write(&self, mut out: impl Write) -> io::Result<()> {
+        self.validate()?;
 
         writeln!(out, "goos: {}", self.goos.trim())?;
         writeln!(out, "goarch: {}", self.goarch.trim())?;
@@ -204,13 +219,10 @@ impl BenchHeader {
         if let Some(cpu) = &self.cpu {
             let trimmed_cpu = cpu.trim();
             if !trimmed_cpu.is_empty() {
-                validate_header_kv("cpu", trimmed_cpu)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
                 writeln!(out, "cpu: {trimmed_cpu}")?;
             }
         }
         for (k, v) in &self.extra {
-            validate_header_kv(k, v).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             writeln!(out, "{k}: {}", v.trim())?;
         }
         Ok(())
@@ -303,6 +315,15 @@ impl BenchRecord<'_> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("ns_per_op must be finite and >= 0, got {}", self.ns_per_op),
+            ));
+        }
+        if self.iterations > i64::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "iterations must be <= i64::MAX for Go benchfmt, got {}",
+                    self.iterations
+                ),
             ));
         }
         let sanitized = sanitize_bench_name(self.name);
@@ -606,6 +627,7 @@ impl BenchConfig {
                 continue;
             }
             if let Some(val) = split_flag(arg, &["-pkg", "--pkg"], &mut iter)? {
+                validate_header_kv("pkg", &val)?;
                 cfg.pkg_override = Some(val);
                 continue;
             }
@@ -996,6 +1018,8 @@ impl<'a> Suite<'a> {
                 "-cpuprofile and -memprofile require enabling the `pprof` Cargo feature on `benchfmt`",
             ));
         }
+
+        self.header.validate()?;
 
         #[cfg(feature = "pprof")]
         let mut builtin_pprof = pprof_support::PprofSession::new(&self.config)?;
@@ -1434,8 +1458,10 @@ mod tests {
         let empty_pat = BenchConfig::from_args(["-bench", "^$"]).unwrap();
         assert_eq!(empty_pat.filter.as_deref(), Some("^$"));
 
-        // Unknown flags and extra positional args fail fast instead of becoming silent filters.
+        // Unknown flags, invalid `--pkg`, and extra positional args fail fast.
         assert!(BenchConfig::from_args(["-benchtimee", "2s"]).is_err());
+        assert!(BenchConfig::from_args(["--pkg", ""]).is_err());
+        assert!(BenchConfig::from_args(["--pkg", "bad\npkg"]).is_err());
         assert!(BenchConfig::from_args(["FilterOne", "FilterTwo"]).is_err());
     }
 
@@ -1518,6 +1544,19 @@ mod tests {
                 cpu_procs: None,
                 iterations: 1,
                 ns_per_op: f64::NAN,
+                mb_per_sec: None,
+                alloc_bytes_per_op: None,
+                allocs_per_op: None,
+            }
+            .write(Vec::new())
+            .is_err()
+        );
+        assert!(
+            BenchRecord {
+                name: "OverflowIters",
+                cpu_procs: None,
+                iterations: (i64::MAX as u64) + 1,
+                ns_per_op: 1.0,
                 mb_per_sec: None,
                 alloc_bytes_per_op: None,
                 allocs_per_op: None,

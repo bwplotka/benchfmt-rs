@@ -96,6 +96,9 @@ where
         }
         if let Some(raw) = take_opt(arg, "--cpu", &mut args)? {
             let n: usize = raw.parse().map_err(|_| format!("invalid --cpu {raw:?}"))?;
+            if n == 0 {
+                return Err("--cpu must be >= 1".to_owned());
+            }
             opts.cpu_procs = Some(n);
             continue;
         }
@@ -185,6 +188,7 @@ mod tests {
 
         // Rejects uppercase `--tag` keys that `benchfmt.Reader` would silently ignore.
         assert!(run_with(["libtest", "--tag", "IMPL=rust"], &b""[..], Vec::new()).is_err());
+        assert!(run_with(["libtest", "--cpu", "0"], &b""[..], Vec::new()).is_err());
         assert!(run_with(["unknown"], &b""[..], Vec::new()).is_err());
         assert!(run_with(["libtest", "--bogus"], &b""[..], Vec::new()).is_err());
         assert!(run_with(["libtest", "a", "b"], &b""[..], Vec::new()).is_err());
