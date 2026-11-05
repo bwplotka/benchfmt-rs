@@ -139,9 +139,12 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAlloc<A> {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let old_addr = ptr.addr();
         // SAFETY: Upheld by the caller of `GlobalAlloc::realloc`.
         let new_ptr = unsafe { self.inner.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
+        // NOTE: Always record growth deterministically to match Go's slice append behavior, while
+        // ignoring in-place shrinks (`shrink_to_fit` / `into_boxed_slice`) that reuse `ptr`.
+        if !new_ptr.is_null() && (new_size > layout.size() || new_ptr.addr() != old_addr) {
             record_thread_alloc(new_size);
         }
         new_ptr
