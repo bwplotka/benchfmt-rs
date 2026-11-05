@@ -1575,22 +1575,89 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
-        // `--list` and `--help` output.
+        // `--list`, `--help`, `--test`, `--ignored`, `--exact`, `-bench '^$'`, and `with_header`.
         let mut list_out = Vec::new();
         Suite::with_config(
             "pkg",
             BenchConfig {
+                filter: Some("Alpha".to_owned()),
+                exact: true,
                 list_only: true,
                 ..BenchConfig::default()
             },
         )
         .bench("Alpha", |b| b.iter(|| 1))
+        .bench("AlphaExtra", |b| b.iter(|| 1))
         .run_to(&mut list_out)
         .unwrap();
         assert_eq!(
             String::from_utf8(list_out).unwrap(),
             "BenchmarkAlpha: benchmark\n"
         );
+
+        let mut help_out = Vec::new();
+        Suite::with_config(
+            "pkg",
+            BenchConfig {
+                show_help: true,
+                ..BenchConfig::default()
+            },
+        )
+        .bench("Alpha", |b| b.iter(|| 1))
+        .run_to(&mut help_out)
+        .unwrap();
+        assert!(String::from_utf8(help_out).unwrap().contains("-benchtime"));
+
+        let mut smoke_runs = 0usize;
+        let mut smoke_out = Vec::new();
+        Suite::with_config(
+            "default_pkg",
+            BenchConfig {
+                test_mode: true,
+                benchtime: BenchTime::Iterations(100),
+                count: 5,
+                pkg_override: Some("override_pkg".to_owned()),
+                ..BenchConfig::default()
+            },
+        )
+        .with_header(BenchHeader {
+            goos: "linux".to_owned(),
+            goarch: "amd64".to_owned(),
+            pkg: "header_pkg".to_owned(),
+            cpu: None,
+            extra: Vec::new(),
+        })
+        .bench("Smoke", |b| {
+            while b.keep_running() {
+                smoke_runs += 1;
+            }
+        })
+        .run_to(&mut smoke_out)
+        .unwrap();
+        assert_eq!(smoke_runs, 1);
+        let smoke_text = String::from_utf8(smoke_out).unwrap();
+        assert!(smoke_text.contains("pkg: override_pkg\n"), "{smoke_text}");
+        assert!(smoke_text.contains("BenchmarkSmoke"), "{smoke_text}");
+
+        for cfg in [
+            BenchConfig {
+                run_ignored_only: true,
+                ..BenchConfig::default()
+            },
+            BenchConfig {
+                filter: Some("^$".to_owned()),
+                ..BenchConfig::default()
+            },
+        ] {
+            let mut empty_out = Vec::new();
+            Suite::with_config("pkg", cfg)
+                .bench("Alpha", |b| b.iter(|| 1))
+                .run_to(&mut empty_out)
+                .unwrap();
+            let empty_text = String::from_utf8(empty_out).unwrap();
+            assert!(!empty_text.contains("BenchmarkAlpha"), "{empty_text}");
+            assert!(empty_text.ends_with("PASS\n"), "{empty_text}");
+        }
     }
 
     #[test]
