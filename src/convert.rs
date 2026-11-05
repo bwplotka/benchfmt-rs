@@ -168,9 +168,6 @@ fn collect_criterion_benchmarks(
     baseline: &str,
     out: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         // Do not follow directory symlinks so symlink loops cannot cause unbounded recursion.
@@ -297,6 +294,9 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("BenchmarkReport/case=1\t"), "{text}");
         assert!(text.contains("50000.00 MB/s"), "{text}");
+
+        let missing_err = convert_criterion_dir(&tmp, &opts, Vec::new()).unwrap_err();
+        assert_eq!(missing_err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

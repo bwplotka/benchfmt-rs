@@ -214,5 +214,6 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         let crit_text = String::from_utf8(crit_out).unwrap();
         assert!(crit_text.contains("BenchmarkGrp/k=1\t"), "{crit_text}");
+        assert!(run_with(["criterion", tmp.to_str().unwrap()], &b""[..], Vec::new()).is_err());
     }
 }
