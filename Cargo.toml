@@ -16,12 +16,22 @@ pprof = ["dep:backtrace", "dep:flate2", "dep:pprof"]
 backtrace = { version = "0.3", optional = true }
 flate2 = { version = "1.1", optional = true }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 pprof = { version = "0.15", default-features = false, optional = true }
+
+# Enable frame-pointer unwinding on macOS so `SIGPROF` never invokes `libunwind` across
+# `_sigtramp`, which faults on Apple Silicon (`aarch64-apple-darwin`).
+[target.'cfg(target_os = "macos")'.dependencies]
+pprof = { version = "0.15", default-features = false, features = ["frame-pointer"], optional = true }
 
 [[bin]]
 name = "benchfmt"
 path = "src/bin/benchfmt.rs"
+
+[[test]]
+name = "pprof"
+path = "tests/pprof.rs"
+required-features = ["pprof"]
 
 [lints.rust]
 missing_docs = "warn"

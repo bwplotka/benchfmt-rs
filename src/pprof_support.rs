@@ -97,6 +97,9 @@ pub(crate) fn maybe_record_heap_alloc(bytes: usize) {
 }
 
 fn slow_check_heap_sample(bytes: usize, rate: usize) {
+    // Synchronize with `HEAP_SAMPLE_RATE` `Release` stores so `SESSION_GEN` is never stale on
+    // weakly-ordered architectures while keeping the disabled fast path barrier-free.
+    std::sync::atomic::fence(Ordering::Acquire);
     let current_gen = SESSION_GEN.load(Ordering::Relaxed);
     let should_sample = THREAD_HEAP_STATE
         .try_with(|cell| {
@@ -292,7 +295,7 @@ impl PprofSession {
 
 impl Drop for PprofSession {
     fn drop(&mut self) {
-        HEAP_SAMPLE_RATE.store(0, Ordering::Relaxed);
+        HEAP_SAMPLE_RATE.store(0, Ordering::Release);
         if let Ok(mut guard) = HEAP_SAMPLES.lock() {
             *guard = None;
         }
@@ -309,13 +312,13 @@ impl Profiler for PprofSession {
         }
         if let Some(mem) = &mut self.mem {
             mem.active_since = Some(Instant::now());
-            HEAP_SAMPLE_RATE.store(mem.rate, Ordering::Relaxed);
+            HEAP_SAMPLE_RATE.store(mem.rate, Ordering::Release);
         }
         Ok(())
     }
 
     fn stop_bench(&mut self, _bench_name: &str) -> io::Result<()> {
-        HEAP_SAMPLE_RATE.store(0, Ordering::Relaxed);
+        HEAP_SAMPLE_RATE.store(0, Ordering::Release);
         if let Some(mem) = &mut self.mem
             && let Some(since) = mem.active_since.take()
         {
@@ -329,7 +332,7 @@ impl Profiler for PprofSession {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        HEAP_SAMPLE_RATE.store(0, Ordering::Relaxed);
+        HEAP_SAMPLE_RATE.store(0, Ordering::Release);
         #[cfg(unix)]
         if let Some(cpu) = &mut self.cpu {
             cpu.write_profile()?;
@@ -531,13 +534,14 @@ fn resolve_return_ip(return_ip: usize, fallback_sym_addr: Option<usize>) -> Vec<
 
 fn is_internal_heap_frame(sym: &ResolvedSymbol) -> bool {
     let n = sym.name.as_str();
+    let trimmed = n.trim_start_matches('_');
     n.starts_with("backtrace::")
         || n.starts_with("benchfmt::pprof_support::")
         || n.starts_with("benchfmt::alloc::")
         || n.starts_with("<benchfmt::alloc::")
         || n.starts_with("__rustc::__rust_")
-        || n.starts_with("__rust_alloc")
-        || n.starts_with("__rust_realloc")
+        || trimmed.starts_with("rust_alloc")
+        || trimmed.starts_with("rust_realloc")
         || n.starts_with("alloc::alloc::")
         || n.starts_with("core::alloc::")
 }
@@ -647,11 +651,29 @@ impl CpuCollector {
             let mut loc_ids = Vec::with_capacity(unresolved.frames.len());
             let mut frame_iter = unresolved.frames.iter();
             while let Some(frame) = frame_iter.next() {
-                let ip = frame.ip() as usize;
+                #[cfg(all(
+                    target_os = "macos",
+                    any(
+                        target_arch = "x86_64",
+                        target_arch = "aarch64",
+                        target_arch = "riscv64",
+                        target_arch = "loongarch64"
+                    )
+                ))]
+                let (ip, sym_addr) = (frame.ip, 0usize);
+                #[cfg(not(all(
+                    target_os = "macos",
+                    any(
+                        target_arch = "x86_64",
+                        target_arch = "aarch64",
+                        target_arch = "riscv64",
+                        target_arch = "loongarch64"
+                    )
+                )))]
+                let (ip, sym_addr) = (frame.ip() as usize, frame.symbol_address() as usize);
                 if ip == 0 {
                     continue;
                 }
-                let sym_addr = frame.symbol_address() as usize;
                 let syms = resolved_cache
                     .entry(ip)
                     .or_insert_with(|| resolve_return_ip(ip, (sym_addr != 0).then_some(sym_addr)))
