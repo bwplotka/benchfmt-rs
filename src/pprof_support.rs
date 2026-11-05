@@ -180,10 +180,13 @@ fn capture_heap_sample(bytes: usize, rate: usize) {
         return;
     }
 
-    // `try_lock` keeps sampling non-blocking and deadlock-free inside `GlobalAlloc`.
-    if let Ok(mut guard) = HEAP_SAMPLES.try_lock()
-        && let Some(map) = guard.as_mut()
-    {
+    // NOTE: `st.in_sample` (`ResetInSampleGuard`) suppresses allocator re-entrancy on this thread
+    // and `SIGPROF` never touches `HEAP_SAMPLES`, so a blocking lock is deadlock-free and avoids
+    // dropping concurrent worker-thread samples under `ProcessAlloc`.
+    let mut guard = HEAP_SAMPLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(map) = guard.as_mut() {
         if let Some(entry) = map.get_mut(&ips[..len]) {
             entry.alloc_objects += scaled_objects;
             entry.alloc_space += scaled_space;
@@ -297,15 +300,16 @@ impl PprofSession {
 
 impl Drop for PprofSession {
     fn drop(&mut self) {
+        let _suppress = SuppressHeapGuard::enter();
         HEAP_SAMPLE_RATE.store(0, Ordering::Release);
         #[cfg(unix)]
         {
             self.cpu = None;
         }
         self.mem = None;
-        if let Ok(mut guard) = HEAP_SAMPLES.lock() {
-            *guard = None;
-        }
+        *HEAP_SAMPLES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -614,13 +618,13 @@ impl CpuCollector {
     }
 
     fn stop_window(&mut self) -> io::Result<()> {
+        // NOTE: Enter `SuppressHeapGuard` before taking `guard` so `ProfilerGuard::drop` stays
+        // hidden from `CountingAlloc` and `ProcessAlloc` even if `build_unresolved` returns `Err`.
+        let _suppress = SuppressHeapGuard::enter();
         let Some((guard, started)) = self.active.take() else {
             return Ok(());
         };
         self.total_duration += started.elapsed();
-        // NOTE: Harvest unresolved frames cheaply between calibration steps and keep `in_sample`
-        // set while dropping `guard` so internal allocations stay hidden from `CountingAlloc`.
-        let _suppress = SuppressHeapGuard::enter();
         let report = guard
             .report()
             .build_unresolved()
