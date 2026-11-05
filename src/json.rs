@@ -117,6 +117,17 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn read_hex_u16(&mut self) -> Result<u16, String> {
+        let val = self
+            .bytes
+            .get(self.pos..self.pos + 4)
+            .and_then(|s| std::str::from_utf8(s).ok())
+            .and_then(|s| u16::from_str_radix(s, 16).ok())
+            .ok_or_else(|| format!("invalid \\u escape at offset {}", self.pos))?;
+        self.pos += 4;
+        Ok(val)
+    }
+
     fn parse_string(&mut self) -> Result<String, String> {
         if self.peek() != Some(b'"') {
             return Err(format!("expected '\"' at offset {}", self.pos));
@@ -127,6 +138,12 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             match b {
                 b'"' => return Ok(out),
+                0x00..=0x1F => {
+                    return Err(format!(
+                        "unescaped control character 0x{b:02x} at offset {}",
+                        self.pos - 1
+                    ));
+                }
                 b'\\' => {
                     let Some(&esc) = self.bytes.get(self.pos) else {
                         return Err("unterminated escape in JSON string".to_owned());
@@ -142,17 +159,34 @@ impl<'a> Parser<'a> {
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
                         b'u' => {
-                            let hex = self
-                                .bytes
-                                .get(self.pos..self.pos + 4)
-                                .and_then(|s| std::str::from_utf8(s).ok())
-                                .and_then(|s| u32::from_str_radix(s, 16).ok())
-                                .and_then(char::from_u32)
-                                .ok_or_else(|| {
+                            let code = self.read_hex_u16()?;
+                            let ch = if (0xD800..=0xDBFF).contains(&code) {
+                                if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                    return Err(format!(
+                                        "unpaired UTF-16 high surrogate at offset {}",
+                                        self.pos
+                                    ));
+                                }
+                                self.pos += 2;
+                                let low = self.read_hex_u16()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(format!(
+                                        "invalid UTF-16 low surrogate at offset {}",
+                                        self.pos
+                                    ));
+                                }
+                                let combined = 0x10000
+                                    + (((u32::from(code) - 0xD800) << 10)
+                                        | (u32::from(low) - 0xDC00));
+                                char::from_u32(combined).ok_or_else(|| {
+                                    format!("invalid surrogate codepoint at offset {}", self.pos)
+                                })?
+                            } else {
+                                char::from_u32(u32::from(code)).ok_or_else(|| {
                                     format!("invalid \\u escape at offset {}", self.pos)
-                                })?;
-                            self.pos += 4;
-                            out.push(hex);
+                                })?
+                            };
+                            out.push(ch);
                         }
                         other => {
                             return Err(format!(
@@ -196,6 +230,9 @@ impl<'a> Parser<'a> {
         let n = s
             .parse::<f64>()
             .map_err(|_| format!("invalid JSON number {s:?} at offset {start}"))?;
+        if !n.is_finite() {
+            return Err(format!("non-finite JSON number {s:?} at offset {start}"));
+        }
         Ok(JsonValue::Number(n))
     }
 
@@ -248,6 +285,58 @@ impl<'a> Parser<'a> {
                 }
                 _ => return Err(format!("expected ',' or '}}' at offset {}", self.pos)),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_types_escapes_and_surrogate_pairs() {
+        let raw = r#"{
+            "ok": true,
+            "no": false,
+            "nil": null,
+            "empty_arr": [],
+            "empty_obj": {},
+            "sci": -1.25e2,
+            "text": "a\"b\\c\/d\n\t\u0041\uD83D\uDE80µ"
+        }"#;
+        let val = parse_json(raw).unwrap();
+        let obj = val.as_object().unwrap();
+        assert_eq!(obj.get("ok"), Some(&JsonValue::Bool(true)));
+        assert_eq!(obj.get("no"), Some(&JsonValue::Bool(false)));
+        assert_eq!(obj.get("nil"), Some(&JsonValue::Null));
+        assert_eq!(obj.get("empty_arr").unwrap().as_array().unwrap().len(), 0);
+        assert_eq!(obj.get("empty_obj").unwrap().as_object().unwrap().len(), 0);
+        assert_eq!(obj.get("sci").unwrap().as_f64(), Some(-125.0));
+        assert_eq!(obj.get("text").unwrap().as_str(), Some("a\"b\\c/d\n\tA🚀µ"));
+    }
+
+    #[test]
+    fn rejects_malformed_json_surrogates_control_chars_and_overflow() {
+        for bad in [
+            "",
+            "{}",
+            r#"{"a": 1} trailing"#,
+            r#""\uD83D""#,
+            r#""\uD83D\u0041""#,
+            r#""\uDC00""#,
+            "\"raw\nnewline\"",
+            "1e500",
+            "[1,]",
+            r#"{"k" 1}"#,
+        ] {
+            if bad == "{}" {
+                assert!(parse_json(bad).is_ok());
+                continue;
+            }
+            assert!(
+                parse_json(bad).is_err(),
+                "expected JSON parse error for {bad:?}"
+            );
         }
     }
 }
