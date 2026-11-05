@@ -184,8 +184,8 @@ fn writes_scoped_mem_and_cpu_pprof_profiles() {
     let cpu_path = dir.join("cpu.pb.gz");
 
     let cfg = BenchConfig {
-        benchtime: BenchTime::Iterations(40),
-        count: 1,
+        benchtime: BenchTime::Iterations(20),
+        count: 2,
         cpu_procs: 1,
         benchmem: true,
         #[cfg(unix)]
@@ -210,10 +210,10 @@ fn writes_scoped_mem_and_cpu_pprof_profiles() {
                 black_box(tracked_box_alloc_helper(7));
                 #[cfg(unix)]
                 {
-                    // Burn both fixed CPU work and ~4ms wall-clock per iteration (~160ms across
-                    // 40 iterations) so 99 Hz `ITIMER_PROF` reliably captures samples even under
-                    // `--release` or brief VM preemption.
-                    black_box(cpu_burn_helper(10_000));
+                    // Burn guaranteed on-CPU work (~150k rounds * 3 loops per iteration across 40
+                    // total iterations) plus ~4ms wall-clock so 99 Hz `ITIMER_PROF` reliably
+                    // captures samples even under `--release` or CI VM preemption.
+                    black_box(cpu_burn_helper(150_000));
                     let until = Instant::now() + Duration::from_millis(4);
                     while Instant::now() < until {
                         black_box(cpu_burn_helper(2_000));
@@ -226,7 +226,13 @@ fn writes_scoped_mem_and_cpu_pprof_profiles() {
 
     assert_eq!(
         companion.events,
-        vec!["start:BurnAndAlloc", "stop:BurnAndAlloc", "finish"]
+        vec![
+            "start:BurnAndAlloc",
+            "stop:BurnAndAlloc",
+            "start:BurnAndAlloc",
+            "stop:BurnAndAlloc",
+            "finish",
+        ]
     );
     let text = String::from_utf8(out).unwrap();
     assert!(
@@ -374,8 +380,33 @@ fn poisson_memprofile_sampling_scales_allocations_and_resets_across_rates() {
     let dir = std::env::temp_dir().join(format!("benchfmt_pprof_poisson_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
+    let disabled_path = dir.join("disabled_mem.pb.gz");
     let huge_rate_path = dir.join("huge_rate_mem.pb.gz");
     let mem_path = dir.join("poisson_mem.pb.gz");
+
+    // `-memprofilerate 0` disables heap sampling while still writing a valid empty profile.
+    Suite::with_config(
+        "pprof_disabled_rate",
+        BenchConfig {
+            benchtime: BenchTime::Iterations(8),
+            mem_profile: Some(disabled_path.clone()),
+            mem_profile_rate: 0,
+            ..BenchConfig::default()
+        },
+    )
+    .with_alloc(&TEST_ALLOC)
+    .bench("DisabledRate", |b| {
+        while b.keep_running() {
+            black_box(tracked_heap_alloc_helper(512));
+        }
+    })
+    .run_to(Vec::new())
+    .unwrap();
+    let mut disabled_raw = Vec::new();
+    flate2::read::GzDecoder::new(&fs::read(&disabled_path).unwrap()[..])
+        .read_to_end(&mut disabled_raw)
+        .unwrap();
+    assert_eq!(sum_pprof_sample_pairs(&disabled_raw), (0, 0));
 
     // Run a huge `mem_profile_rate` first on this thread so TLS `bytes_until_sample` would be
     // megabytes high if `PprofSession` failed to reset per-thread sampling state across runs.

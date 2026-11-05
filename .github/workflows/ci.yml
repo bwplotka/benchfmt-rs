@@ -50,12 +50,18 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Run clippy (default)
+        run: cargo clippy --all-targets -- -D warnings
       - name: Run clippy (pprof)
         run: cargo clippy --all-targets --features pprof -- -D warnings
       - name: Run tests (default)
         run: cargo test
       - name: Run tests (pprof)
         run: cargo test --features pprof
+      - name: Run release tests with line-table debuginfo (pprof)
+        env:
+          RUSTFLAGS: -C debuginfo=1
+        run: cargo test --release --features pprof
 
   msrv:
     name: MSRV (1.88)
