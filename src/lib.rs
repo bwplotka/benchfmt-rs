@@ -765,6 +765,9 @@ impl<'a> Bencher<'a> {
 
     /// Resets the elapsed timer and allocation baseline, excluding any prior setup work.
     pub fn reset_timer(&mut self) {
+        if self.started && self.start_instant.is_none() {
+            return;
+        }
         if self.profiler_running
             && let Some(prof) = self.profiler.as_deref_mut()
             && let Err(err) = prof
@@ -785,6 +788,7 @@ impl<'a> Bencher<'a> {
         let now = Instant::now();
         self.fallback_start = now;
         if self.start_instant.is_some() {
+            self.remaining = self.target_n;
             self.start_instant = Some(now);
         }
     }
@@ -1508,9 +1512,11 @@ mod tests {
                 while b.keep_running() {
                     black_box(vec![2u8; 128]);
                 }
-                // Extra post-loop `keep_running()` call must not overwrite `alloc_delta`.
+                // Extra post-loop `keep_running()` and `reset_timer()` calls must not overwrite
+                // `elapsed` or `alloc_delta`.
                 let _after = vec![3u8; 8192];
                 assert!(!b.keep_running());
+                b.reset_timer();
                 black_box(_after);
             })
             .bench("decode/case=ignored_case", |b| b.iter(|| 1))
