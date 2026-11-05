@@ -1691,8 +1691,8 @@ mod tests {
         );
         handle.join().unwrap();
 
-        // `vec![0u8; 512]` exercises `alloc_zeroed`, and `into_boxed_slice` on over-allocated
-        // capacity exercises `realloc` shrink without inflating `allocs/op` when in-place.
+        // `vec![0u8; 512]` exercises `alloc_zeroed`, and `reserve_exact` exercises `realloc`
+        // growth deterministically even when the system allocator extends in-place.
         let mut out = Vec::new();
         Suite::with_config(
             "pkg",
@@ -1704,15 +1704,18 @@ mod tests {
             },
         )
         .with_alloc(&TEST_ALLOC)
-        .bench("ZeroedAlloc", |b| {
+        .bench("ZeroedAndReallocGrow", |b| {
             while b.keep_running() {
                 black_box(vec![0u8; 512]);
+                let mut v = Vec::<u8>::with_capacity(64);
+                v.reserve_exact(192);
+                black_box(v);
             }
         })
         .run_to(&mut out)
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("     512 B/op\t       1 allocs/op"), "{text}");
+        assert!(text.contains("     768 B/op\t       3 allocs/op"), "{text}");
 
         // Wrapping delta behavior.
         let wrapped = AllocSnapshot {

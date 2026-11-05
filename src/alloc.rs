@@ -257,3 +257,61 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for ProcessAlloc<A> {
         new_ptr
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubRealloc {
+        relocate_on_shrink: bool,
+    }
+
+    unsafe impl GlobalAlloc for StubRealloc {
+        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+            std::ptr::without_provenance_mut(0x1000)
+        }
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if new_size < layout.size() && self.relocate_on_shrink {
+                std::ptr::without_provenance_mut(ptr.addr() + 0x1000)
+            } else {
+                ptr
+            }
+        }
+    }
+
+    #[test]
+    fn realloc_counts_growth_and_relocating_shrink_but_ignores_in_place_shrink() {
+        let in_place = CountingAlloc::with_allocator(StubRealloc {
+            relocate_on_shrink: false,
+        });
+        let layout = Layout::from_size_align(128, 8).unwrap();
+        let s0 = in_place.snapshot();
+        let ptr = unsafe { in_place.alloc(layout) };
+        // In-place growth (`new_size > layout.size()`) must be counted even when `new_ptr == ptr`.
+        let ptr = unsafe { in_place.realloc(ptr, layout, 256) };
+        let grown_layout = Layout::from_size_align(256, 8).unwrap();
+        // In-place shrink (`new_size <= layout.size()` and `new_ptr == ptr`) must be ignored.
+        let _ = unsafe { in_place.realloc(ptr, grown_layout, 64) };
+        assert_eq!(
+            s0.delta_to(in_place.snapshot()),
+            AllocSnapshot {
+                allocs: 2,
+                bytes: 128 + 256,
+            }
+        );
+
+        let relocating = CountingAlloc::with_allocator(StubRealloc {
+            relocate_on_shrink: true,
+        });
+        let s1 = relocating.snapshot();
+        let _ = unsafe { relocating.realloc(ptr, grown_layout, 64) };
+        assert_eq!(
+            s1.delta_to(relocating.snapshot()),
+            AllocSnapshot {
+                allocs: 1,
+                bytes: 64,
+            }
+        );
+    }
+}
