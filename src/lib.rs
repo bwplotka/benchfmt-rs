@@ -498,10 +498,13 @@ impl BenchConfig {
                 arg,
                 "--bench"
                     | "--nocapture"
+                    | "--no-capture"
                     | "--show-output"
                     | "--quiet"
                     | "-q"
                     | "--include-ignored"
+                    | "--report-time"
+                    | "--ensure-time"
                     | "-v"
                     | "-test.v"
                     | "-test.paniconexit0"
@@ -526,8 +529,20 @@ impl BenchConfig {
                 cfg.run_ignored_only = true;
                 continue;
             }
-            if arg == "-benchmem" || arg == "--benchmem" || arg == "-test.benchmem" {
+            if matches!(arg, "-benchmem" | "--benchmem" | "-test.benchmem") {
                 cfg.benchmem = true;
+                continue;
+            }
+            if let Some(val) = arg
+                .strip_prefix("-benchmem=")
+                .or_else(|| arg.strip_prefix("--benchmem="))
+                .or_else(|| arg.strip_prefix("-test.benchmem="))
+            {
+                cfg.benchmem = match val {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => return Err(format!("invalid -benchmem value {val:?}")),
+                };
                 continue;
             }
             if split_flag(
@@ -540,7 +555,6 @@ impl BenchConfig {
                     "--format",
                     "--test-threads",
                     "--logfile",
-                    "--report-time",
                     "-timeout",
                     "-test.timeout",
                     "-test.gocoverdir",
@@ -1392,6 +1406,25 @@ mod tests {
         assert_eq!(cfg.filter, None);
         assert!(cfg.exact);
         assert_eq!(cfg.skip, vec!["Slow"]);
+
+        // Boolean `libtest` flags (`--report-time`, `--ensure-time`, `--no-capture`) do not
+        // swallow a trailing positional filter, and Go `-test.benchmem=true/false` is supported.
+        let libtest_bool = BenchConfig::from_args([
+            "--report-time",
+            "--ensure-time",
+            "--no-capture",
+            "-test.benchmem=true",
+            "Decode",
+        ])
+        .unwrap();
+        assert_eq!(libtest_bool.filter.as_deref(), Some("Decode"));
+        assert!(libtest_bool.benchmem);
+        assert!(
+            !BenchConfig::from_args(["-benchmem=false"])
+                .unwrap()
+                .benchmem
+        );
+        assert!(BenchConfig::from_args(["-test.benchmem=maybe"]).is_err());
 
         // `-bench '^$'` matches nothing rather than everything.
         let empty_pat = BenchConfig::from_args(["-bench", "^$"]).unwrap();
