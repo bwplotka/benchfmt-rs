@@ -348,14 +348,19 @@ impl BenchRecord<'_> {
     }
 }
 
-/// Strips a single leading `"Benchmark"` prefix only when it acts as Go's `Benchmark*` boundary
-/// (empty remainder or followed by a non-lowercase character), preserving words like
-/// `"Benchmarking"`.
-fn strip_benchmark_prefix(s: &str) -> &str {
-    if let Some(rest) = s.strip_prefix("Benchmark")
-        && rest.chars().next().is_none_or(|ch| !ch.is_lowercase())
+/// Strips leading `"Benchmark"` or `"benchmark"` prefixes when they act as Go's `Benchmark*`
+/// boundary (empty remainder or followed by a non-lowercase character), preserving words like
+/// `"Benchmarking"` while keeping [`sanitize_bench_name`] idempotent.
+fn strip_benchmark_prefix(mut s: &str) -> &str {
+    while let Some(rest) = s
+        .strip_prefix("Benchmark")
+        .or_else(|| s.strip_prefix("benchmark"))
     {
-        return rest;
+        if rest.chars().next().is_none_or(|ch| !ch.is_lowercase()) {
+            s = rest;
+        } else {
+            break;
+        }
     }
     s
 }
@@ -1396,8 +1401,21 @@ mod tests {
     #[test]
     fn sanitizes_names_and_validates_headers_and_precision_tiers() {
         assert_eq!(sanitize_bench_name("Benchmarking/sub"), "Benchmarking/sub");
+        assert_eq!(sanitize_bench_name("benchmarking/sub"), "Benchmarking/sub");
         assert_eq!(sanitize_bench_name("Benchmarks"), "Benchmarks");
-        assert_eq!(sanitize_bench_name("BenchmarkBenchmarkFoo"), "BenchmarkFoo");
+        assert_eq!(sanitize_bench_name("BenchmarkBenchmarkFoo"), "Foo");
+        assert_eq!(sanitize_bench_name("benchmark_decode"), "_decode");
+        for sample in [
+            "Benchmarking/sub",
+            "benchmarking/sub",
+            "BenchmarkBenchmarkFoo",
+            "benchmark_decode",
+            "Benchmark",
+            "benchmark",
+        ] {
+            let once = sanitize_bench_name(sample);
+            assert_eq!(sanitize_bench_name(&once), once, "non-idempotent: {sample}");
+        }
         assert_eq!(sanitize_bench_name("decode\tline\ninj"), "Decode_line_inj");
         assert_eq!(sanitize_bench_name("   "), "_");
         assert_eq!(sanitize_bench_name("Benchmark"), "_");
