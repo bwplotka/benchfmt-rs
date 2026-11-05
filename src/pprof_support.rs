@@ -540,16 +540,22 @@ fn resolve_return_ip(return_ip: usize, fallback_sym_addr: Option<usize>) -> Vec<
 
 fn is_internal_heap_frame(sym: &ResolvedSymbol) -> bool {
     let n = sym.name.as_str();
+    // Strip leading `<` / `&` so Rust v0-mangled inherent and trait impls such as
+    // `<alloc::alloc::Global>::alloc_impl_runtime` and `<std::alloc::System>::alloc_impl` match
+    // alongside free functions like `alloc::alloc::alloc`.
+    let norm = n.trim_start_matches(['<', '&']);
     let trimmed = n.trim_start_matches('_');
-    n.starts_with("backtrace::")
-        || n.starts_with("benchfmt::pprof_support::")
-        || n.starts_with("benchfmt::alloc::")
-        || n.starts_with("<benchfmt::alloc::")
+    norm.starts_with("backtrace::")
+        || norm.starts_with("benchfmt::pprof_support::")
+        || norm.starts_with("benchfmt::alloc::")
         || n.starts_with("__rustc::__rust_")
         || trimmed.starts_with("rust_alloc")
         || trimmed.starts_with("rust_realloc")
-        || n.starts_with("alloc::alloc::")
-        || n.starts_with("core::alloc::")
+        || trimmed.starts_with("rg_alloc")
+        || trimmed.starts_with("rg_realloc")
+        || norm.starts_with("alloc::alloc::")
+        || norm.starts_with("core::alloc::")
+        || norm.starts_with("std::alloc::")
 }
 
 #[cfg(unix)]
@@ -798,10 +804,13 @@ mod tests {
                     "<benchfmt::alloc::CountingAlloc as core::alloc::global::GlobalAlloc>::alloc",
                 )],
             ),
-            // User physical frame where `alloc::alloc::alloc` was inlined via `Box::new`.
+            // User physical frame where `<alloc::alloc::Global>::alloc_impl_runtime` and
+            // `alloc::alloc::alloc` were inlined via `Box::new`.
             (
                 0x2000,
                 vec![
+                    mk("<std::alloc::System>::alloc_impl"),
+                    mk("<alloc::alloc::Global>::alloc_impl_runtime"),
                     mk("alloc::alloc::alloc"),
                     mk("alloc::alloc::exchange_malloc"),
                     mk("alloc::boxed::Box<T>::new"),
@@ -817,6 +826,23 @@ mod tests {
         assert_eq!(frames[0].1.len(), 2);
         assert_eq!(frames[0].1[0].name, "alloc::boxed::Box<T>::new");
         assert_eq!(frames[0].1[1].name, "my_crate::my_box_alloc_fn");
+
+        // Unsymbolicated leaf frame directly preceding a mixed inline user frame is drained.
+        let mut unsym_before_mixed = vec![
+            (0x1000, Vec::new()),
+            (
+                0x2000,
+                vec![
+                    mk("<alloc::alloc::Global>::alloc_impl_runtime"),
+                    mk("my_crate::f"),
+                ],
+            ),
+        ];
+        strip_internal_heap_frames(&mut unsym_before_mixed);
+        assert_eq!(unsym_before_mixed.len(), 1);
+        assert_eq!(unsym_before_mixed[0].0, 0x2000);
+        assert_eq!(unsym_before_mixed[0].1.len(), 1);
+        assert_eq!(unsym_before_mixed[0].1[0].name, "my_crate::f");
 
         // Leading unsymbolicated user frames are preserved when not followed by internal frames.
         let mut user_unsymbolicated = vec![(0x4000, Vec::new()), (0x5000, vec![mk("my_crate::f")])];

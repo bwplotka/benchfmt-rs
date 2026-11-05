@@ -255,8 +255,8 @@ fn writes_scoped_mem_and_cpu_pprof_profiles() {
         "setup allocations outside keep_running leaked into memprofile"
     );
     assert!(
-        !mem_lossy.contains("capture_heap_sample"),
-        "internal heap sampler frames leaked into memprofile"
+        !mem_lossy.contains("capture_heap_sample") && !mem_lossy.contains("alloc_impl"),
+        "internal heap sampler or Global/System allocator frames leaked into memprofile"
     );
     let (mem_objs, mem_bytes) = sum_pprof_sample_pairs(&mem_raw);
     assert_eq!(
