@@ -17,6 +17,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 thread_local! {
     // `const` initialization guarantees TLS access never triggers a recursive heap allocation.
@@ -142,6 +143,113 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAlloc<A> {
         let new_ptr = unsafe { self.inner.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
             record_thread_alloc(new_size);
+        }
+        new_ptr
+    }
+}
+
+/// Process-wide [`GlobalAlloc`] wrapper that counts heap allocations and allocated bytes across
+/// all threads using relaxed atomics.
+///
+/// Prefer [`CountingAlloc`] for single-threaded benchmarks to avoid atomic cache-line traffic and
+/// background-thread noise. Use [`ProcessAlloc`] when a benchmark dispatches work onto worker
+/// threads, such as a multi-threaded Tokio runtime or Rayon pool, during sequential
+/// [`crate::Suite`] epochs so worker allocations are included in `B/op` and `allocs/op`.
+pub struct ProcessAlloc<A = System> {
+    inner: A,
+    allocs: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl ProcessAlloc<System> {
+    /// Creates a [`ProcessAlloc`] wrapping [`std::alloc::System`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::with_allocator(System)
+    }
+}
+
+impl Default for ProcessAlloc<System> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A> ProcessAlloc<A> {
+    /// Creates a [`ProcessAlloc`] wrapping a custom [`GlobalAlloc`] implementation.
+    #[must_use]
+    pub const fn with_allocator(inner: A) -> Self {
+        Self {
+            inner,
+            allocs: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Captures the current cumulative process-wide allocation counters.
+    #[must_use]
+    pub fn snapshot(&self) -> AllocSnapshot {
+        AllocSnapshot {
+            allocs: self.allocs.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    #[inline]
+    fn record_alloc(&self, bytes: usize) {
+        #[cfg(feature = "pprof")]
+        if crate::pprof_support::is_in_heap_sample() {
+            return;
+        }
+        self.allocs.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        #[cfg(feature = "pprof")]
+        crate::pprof_support::maybe_record_heap_alloc(bytes);
+    }
+}
+
+impl<A: Sync> AllocTracker for ProcessAlloc<A> {
+    fn snapshot(&self) -> AllocSnapshot {
+        Self::snapshot(self)
+    }
+}
+
+// SAFETY: Every allocation call delegates directly to `self.inner` with identical layout and
+// pointer arguments, only updating relaxed atomic counters on success.
+unsafe impl<A: GlobalAlloc> GlobalAlloc for ProcessAlloc<A> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: Upheld by the caller of `GlobalAlloc::alloc`.
+        let ptr = unsafe { self.inner.alloc(layout) };
+        if !ptr.is_null() {
+            self.record_alloc(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: Upheld by the caller of `GlobalAlloc::dealloc`.
+        unsafe { self.inner.dealloc(ptr, layout) };
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: Upheld by the caller of `GlobalAlloc::alloc_zeroed`.
+        // Overridden explicitly so inner allocators that delegate `alloc_zeroed` to `alloc`
+        // do not double-count.
+        let ptr = unsafe { self.inner.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            self.record_alloc(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let old_addr = ptr.addr();
+        // SAFETY: Upheld by the caller of `GlobalAlloc::realloc`.
+        let new_ptr = unsafe { self.inner.realloc(ptr, layout, new_size) };
+        // NOTE: Always record growth deterministically to match Go's slice append behavior, while
+        // ignoring in-place shrinks (`shrink_to_fit` / `into_boxed_slice`) that reuse `ptr`.
+        if !new_ptr.is_null() && (new_size > layout.size() || new_ptr.addr() != old_addr) {
+            self.record_alloc(new_size);
         }
         new_ptr
     }

@@ -57,7 +57,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use alloc::{AllocSnapshot, AllocTracker, CountingAlloc};
+pub use alloc::{AllocSnapshot, AllocTracker, CountingAlloc, ProcessAlloc};
 pub use convert::{ConvertOptions, convert_criterion_dir, convert_libtest_output};
 
 const MAX_ITERATIONS: u64 = 1_000_000_000;
