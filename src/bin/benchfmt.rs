@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::process;
 
 use benchfmt::{
-    BenchHeader, ConvertOptions, convert_criterion_dir, convert_libtest_output, validate_header_kv,
+    ConvertOptions, convert_criterion_dir, convert_libtest_output, validate_header_kv,
 };
 
 const USAGE: &str = "\
@@ -127,12 +127,6 @@ where
         }
         positional = Some(arg.to_owned());
     }
-
-    // Re-detect host metadata while preserving user-provided `pkg` and tags.
-    let pkg = opts.header.pkg.clone();
-    let extra = std::mem::take(&mut opts.header.extra);
-    opts.header = BenchHeader::detect(pkg);
-    opts.header.extra = extra;
 
     match subcmd {
         "criterion" => {
