@@ -1771,19 +1771,117 @@ mod tests {
 
     #[cfg(feature = "pprof")]
     #[inline(never)]
+    fn tracked_box_alloc_helper(seed: u8) -> Box<[u8; 256]> {
+        // Under `--release` with `-C debuginfo=1`, `Box::new` inlines `alloc::alloc::alloc`
+        // directly into this function's physical stack frame.
+        Box::new([seed; 256])
+    }
+
+    #[cfg(feature = "pprof")]
+    #[inline(never)]
     fn cpu_burn_helper(rounds: u64) -> u64 {
         let mut acc = 1u64;
         for i in 0..rounds {
-            acc = acc.wrapping_mul(6364136223846793005).wrapping_add(i | 1);
-            black_box(acc);
+            acc = black_box(acc.wrapping_mul(6364136223846793005).wrapping_add(i | 1));
         }
         acc
+    }
+
+    /// Minimal protobuf wire reader extracting `(values[0], values[1])` across all `Profile.sample`
+    /// messages (field 2, packed `repeated int64 value` at field 2) for deterministic scaling tests.
+    #[cfg(feature = "pprof")]
+    fn sum_pprof_sample_pairs(mut buf: &[u8]) -> (i64, i64) {
+        fn read_varint(b: &mut &[u8]) -> u64 {
+            let mut out = 0u64;
+            let mut shift = 0u32;
+            while let Some((&byte, rest)) = b.split_first() {
+                *b = rest;
+                out |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            out
+        }
+        fn skip_field(b: &mut &[u8], wire: u64) {
+            match wire {
+                0 => {
+                    let _ = read_varint(b);
+                }
+                1 => *b = &b[8.min(b.len())..],
+                2 => {
+                    let len = read_varint(b) as usize;
+                    *b = &b[len.min(b.len())..];
+                }
+                5 => *b = &b[4.min(b.len())..],
+                _ => *b = &[],
+            }
+        }
+
+        let mut total_v0 = 0i64;
+        let mut total_v1 = 0i64;
+        while !buf.is_empty() {
+            let tag = read_varint(&mut buf);
+            let (field, wire) = (tag >> 3, tag & 7);
+            if field == 2 && wire == 2 {
+                let len = read_varint(&mut buf) as usize;
+                let mut sample = &buf[..len];
+                buf = &buf[len..];
+                let mut vals = Vec::new();
+                while !sample.is_empty() {
+                    let stag = read_varint(&mut sample);
+                    let (sfield, swire) = (stag >> 3, stag & 7);
+                    if sfield == 2 && swire == 2 {
+                        let vlen = read_varint(&mut sample) as usize;
+                        let mut packed = &sample[..vlen];
+                        sample = &sample[vlen..];
+                        while !packed.is_empty() {
+                            vals.push(read_varint(&mut packed) as i64);
+                        }
+                    } else if sfield == 2 && swire == 0 {
+                        vals.push(read_varint(&mut sample) as i64);
+                    } else {
+                        skip_field(&mut sample, swire);
+                    }
+                }
+                if vals.len() >= 2 {
+                    total_v0 += vals[0];
+                    total_v1 += vals[1];
+                }
+            } else {
+                skip_field(&mut buf, wire);
+            }
+        }
+        (total_v0, total_v1)
     }
 
     #[cfg(feature = "pprof")]
     #[test]
     fn writes_scoped_mem_and_cpu_pprof_profiles() {
         use std::io::Read;
+
+        #[derive(Default)]
+        struct CustomCompanionProfiler {
+            events: Vec<String>,
+            internal_bufs: Vec<Vec<u8>>,
+        }
+        impl Profiler for CustomCompanionProfiler {
+            fn start_bench(&mut self, bench_name: &str) -> io::Result<()> {
+                self.internal_bufs.push(vec![1u8; 4096]);
+                self.events.push(format!("start:{bench_name}"));
+                Ok(())
+            }
+            fn stop_bench(&mut self, bench_name: &str) -> io::Result<()> {
+                self.internal_bufs.push(vec![2u8; 4096]);
+                self.events.push(format!("stop:{bench_name}"));
+                Ok(())
+            }
+            fn finish(&mut self) -> io::Result<()> {
+                self.events.push("finish".to_owned());
+                Ok(())
+            }
+        }
 
         let dir = std::env::temp_dir().join(format!("benchfmt_pprof_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1805,24 +1903,36 @@ mod tests {
             ..BenchConfig::default()
         };
 
+        let mut companion = CustomCompanionProfiler::default();
         let mut out = Vec::new();
         Suite::with_config("pprof_test", cfg)
             .with_alloc(&TEST_ALLOC)
+            .with_profiler(&mut companion)
             .bench("BurnAndAlloc", |b| {
                 // Unmeasured setup allocation must not appear in `B/op` or `mem.pb.gz`.
                 let unmeasured_setup = unmeasured_setup_alloc_helper(65_536);
                 black_box(&unmeasured_setup);
                 while b.keep_running() {
                     black_box(tracked_heap_alloc_helper(2048));
-                    black_box(cpu_burn_helper(250_000));
+                    black_box(tracked_box_alloc_helper(7));
+                    // Burn ~3ms per iteration (~120ms total across 40 iterations) so 99 Hz
+                    // `SIGPROF` reliably captures samples even under `--release`.
+                    let until = Instant::now() + Duration::from_millis(3);
+                    while Instant::now() < until {
+                        black_box(cpu_burn_helper(10_000));
+                    }
                 }
             })
             .run_to(&mut out)
             .unwrap();
 
+        assert_eq!(
+            companion.events,
+            vec!["start:BurnAndAlloc", "stop:BurnAndAlloc", "finish"]
+        );
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains("    2048 B/op\t       1 allocs/op"),
+            text.contains("    2304 B/op\t       2 allocs/op"),
             "profiler internal allocations leaked into benchfmt output:\n{text}"
         );
 
@@ -1836,11 +1946,21 @@ mod tests {
         assert!(mem_lossy.contains("alloc_space"), "{mem_lossy}");
         assert!(
             mem_lossy.contains("tracked_heap_alloc_helper"),
-            "expected symbolicated helper in memprofile"
+            "expected symbolicated Vec helper in memprofile"
+        );
+        assert!(
+            mem_lossy.contains("tracked_box_alloc_helper"),
+            "expected inlined Box::new helper in memprofile"
         );
         assert!(
             !mem_lossy.contains("unmeasured_setup_alloc_helper"),
             "setup allocations outside keep_running leaked into memprofile"
+        );
+        let (mem_objs, mem_bytes) = sum_pprof_sample_pairs(&mem_raw);
+        assert_eq!(
+            (mem_objs, mem_bytes),
+            (80, 40 * (2048 + 256)),
+            "companion profiler or setup allocations leaked into memprofile totals"
         );
 
         #[cfg(unix)]
@@ -1876,6 +1996,10 @@ mod tests {
                 mem_stdout.contains("tracked_heap_alloc_helper"),
                 "go tool pprof -top missing tracked_heap_alloc_helper:\n{mem_stdout}"
             );
+            assert!(
+                mem_stdout.contains("tracked_box_alloc_helper"),
+                "go tool pprof -top missing tracked_box_alloc_helper:\n{mem_stdout}"
+            );
 
             #[cfg(unix)]
             {
@@ -1893,6 +2017,26 @@ mod tests {
                     cpu_stdout.contains("cpu_burn_helper"),
                     "go tool pprof -top missing cpu_burn_helper:\n{cpu_stdout}"
                 );
+
+                #[cfg(target_os = "linux")]
+                {
+                    let cpu_disasm = std::process::Command::new("go")
+                        .args([
+                            "tool",
+                            "pprof",
+                            "-disasm",
+                            "cpu_burn_helper",
+                            cpu_path.to_str().unwrap(),
+                        ])
+                        .output()
+                        .unwrap();
+                    let disasm_stdout = String::from_utf8_lossy(&cpu_disasm.stdout);
+                    let disasm_stderr = String::from_utf8_lossy(&cpu_disasm.stderr);
+                    assert!(
+                        cpu_disasm.status.success() && disasm_stdout.contains("cpu_burn_helper"),
+                        "go tool pprof -disasm failed (PIE SVMA->AVMA mapping mismatch):\nstdout:\n{disasm_stdout}\nstderr:\n{disasm_stderr}"
+                    );
+                }
             }
         }
 
@@ -1901,14 +2045,35 @@ mod tests {
 
     #[cfg(feature = "pprof")]
     #[test]
-    fn poisson_memprofile_sampling_scales_allocations() {
+    fn poisson_memprofile_sampling_scales_allocations_and_resets_across_rates() {
         use std::io::Read;
 
         let dir =
             std::env::temp_dir().join(format!("benchfmt_pprof_poisson_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        let huge_rate_path = dir.join("huge_rate_mem.pb.gz");
         let mem_path = dir.join("poisson_mem.pb.gz");
+
+        // Run a huge `mem_profile_rate` first on this thread so TLS `bytes_until_sample` would be
+        // megabytes high if `PprofSession` failed to reset per-thread sampling state across runs.
+        Suite::with_config(
+            "pprof_huge_rate",
+            BenchConfig {
+                benchtime: BenchTime::Iterations(4),
+                mem_profile: Some(huge_rate_path),
+                mem_profile_rate: 64 * 1024 * 1024,
+                ..BenchConfig::default()
+            },
+        )
+        .with_alloc(&TEST_ALLOC)
+        .bench("WarmTls", |b| {
+            while b.keep_running() {
+                black_box(tracked_heap_alloc_helper(256));
+            }
+        })
+        .run_to(Vec::new())
+        .unwrap();
 
         let cfg = BenchConfig {
             benchtime: BenchTime::Iterations(1_000),
@@ -1942,6 +2107,16 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&mem_raw).contains("tracked_heap_alloc_helper"),
             "expected sampled stack in Poisson memprofile"
+        );
+        // True allocations are 1,000 objects and 1,024,000 bytes (~62 raw samples scaled ~16.5x).
+        let (scaled_objs, scaled_bytes) = sum_pprof_sample_pairs(&mem_raw);
+        assert!(
+            (400..=1_800).contains(&scaled_objs),
+            "expected scaled alloc_objects near 1000, got {scaled_objs}"
+        );
+        assert!(
+            (400_000..=1_800_000).contains(&scaled_bytes),
+            "expected scaled alloc_space near 1024000, got {scaled_bytes}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
