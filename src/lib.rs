@@ -777,21 +777,29 @@ impl<'a> Bencher<'a> {
         self.report_allocs = true;
     }
 
-    /// Resets the elapsed timer and allocation baseline, excluding any prior setup work.
+    /// Resets the elapsed timer and allocation baseline before the benchmark loop starts,
+    /// excluding any prior one-time setup work.
+    ///
+    /// Calling `reset_timer` inside an active [`Bencher::keep_running`] loop is unsupported
+    /// (matching Go 1.24's `b.Loop()`) and causes [`Suite::run_to`] to return
+    /// [`io::ErrorKind::InvalidInput`].
     pub fn reset_timer(&mut self) {
-        if self.started && self.start_instant.is_none() {
-            return;
-        }
-        if self.profiler_running
-            && let Some(prof) = self.profiler.as_deref_mut()
-            && let Err(err) = prof
-                .stop_bench(self.bench_name)
-                .and_then(|()| prof.start_bench(self.bench_name))
-        {
-            self.profiler_running = false;
-            if self.profiler_err.is_none() {
-                self.profiler_err = Some(err);
+        if self.started {
+            if self.start_instant.is_some() {
+                // Abort the loop immediately so per-iteration `reset_timer()` calls never hang or
+                // mismeasure `target_n + 1` iterations.
+                self.remaining = 0;
+                if self.profiler_err.is_none() {
+                    self.profiler_err = Some(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "benchmark {:?} called reset_timer() inside keep_running(); move one-time setup before keep_running()",
+                            self.bench_name
+                        ),
+                    ));
+                }
             }
+            return;
         }
         if let Some(tracker) = self.alloc_tracker {
             let snap = tracker.snapshot();
@@ -799,12 +807,7 @@ impl<'a> Bencher<'a> {
             self.fallback_start_alloc = snap;
         }
         self.elapsed = Duration::ZERO;
-        let now = Instant::now();
-        self.fallback_start = now;
-        if self.start_instant.is_some() {
-            self.remaining = self.target_n;
-            self.start_instant = Some(now);
-        }
+        self.fallback_start = Instant::now();
     }
 
     /// Go 1.24 `b.Loop()` equivalent: starts timing and allocation tracking on the first call,
@@ -1607,6 +1610,27 @@ mod tests {
         .run_to(Vec::new())
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Calling `reset_timer()` inside `keep_running()` aborts immediately with `InvalidInput`
+        // rather than hanging or running `N + 1` iterations.
+        let mut in_loop_iters = 0usize;
+        let reset_err = Suite::with_config(
+            "pkg",
+            BenchConfig {
+                benchtime: BenchTime::Iterations(10),
+                ..BenchConfig::default()
+            },
+        )
+        .bench("ResetInLoop", |b| {
+            while b.keep_running() {
+                in_loop_iters += 1;
+                b.reset_timer();
+            }
+        })
+        .run_to(Vec::new())
+        .unwrap_err();
+        assert_eq!(reset_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(in_loop_iters, 1);
 
         // `--list`, `--help`, `--test`, `--ignored`, `--exact`, `-bench '^$'`, and `with_header`.
         let mut list_out = Vec::new();
