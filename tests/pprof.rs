@@ -254,6 +254,10 @@ fn writes_scoped_mem_and_cpu_pprof_profiles() {
         !mem_lossy.contains("unmeasured_setup_alloc_helper"),
         "setup allocations outside keep_running leaked into memprofile"
     );
+    assert!(
+        !mem_lossy.contains("capture_heap_sample"),
+        "internal heap sampler frames leaked into memprofile"
+    );
     let (mem_objs, mem_bytes) = sum_pprof_sample_pairs(&mem_raw);
     assert_eq!(
         (mem_objs, mem_bytes),
@@ -275,6 +279,26 @@ fn writes_scoped_mem_and_cpu_pprof_profiles() {
             cpu_lossy.contains("cpu_burn_helper"),
             "expected symbolicated helper in cpuprofile"
         );
+        assert!(
+            !cpu_lossy.contains("perf_signal_handler"),
+            "SIGPROF signal handler frame leaked into cpuprofile"
+        );
+    }
+
+    #[cfg(not(unix))]
+    {
+        let err = Suite::with_config(
+            "pprof_unsupported_cpu",
+            BenchConfig {
+                benchtime: BenchTime::Iterations(1),
+                cpu_profile: Some(dir.join("cpu.pb.gz")),
+                ..BenchConfig::default()
+            },
+        )
+        .bench("Noop", |b| b.iter(|| 1))
+        .run_to(Vec::new())
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     if let Ok(go_ver) = std::process::Command::new("go").arg("version").output()

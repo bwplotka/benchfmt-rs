@@ -19,9 +19,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process;
 
-use benchfmt::{
-    ConvertOptions, convert_criterion_dir, convert_libtest_output, validate_header_kv,
-};
+use benchfmt::{ConvertOptions, convert_criterion_dir, convert_libtest_output, validate_header_kv};
 
 const USAGE: &str = "\
 Usage:

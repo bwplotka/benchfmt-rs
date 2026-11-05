@@ -654,7 +654,7 @@ impl CpuCollector {
             if count <= 0 {
                 continue;
             }
-            let mut loc_ids = Vec::with_capacity(unresolved.frames.len());
+            let mut frame_symbols = Vec::with_capacity(unresolved.frames.len());
             let mut frame_iter = unresolved.frames.iter();
             while let Some(frame) = frame_iter.next() {
                 #[cfg(all(
@@ -696,12 +696,17 @@ impl CpuCollector {
                         "perf_signal_handler" | "_perf_signal_handler"
                     )
                 }) {
-                    loc_ids.clear();
+                    frame_symbols.clear();
                     frame_iter.next();
                     continue;
                 }
 
-                loc_ids.push(builder.intern_location(ip.saturating_sub(1) as u64, &syms));
+                frame_symbols.push((ip.saturating_sub(1) as u64, syms));
+            }
+
+            let mut loc_ids = Vec::with_capacity(frame_symbols.len());
+            for (addr, syms) in &frame_symbols {
+                loc_ids.push(builder.intern_location(*addr, syms));
             }
 
             let name_len = unresolved

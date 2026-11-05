@@ -120,7 +120,7 @@ go tool pprof -http=:8080 cpu.pb.gz
 go tool pprof -http=:8080 mem.pb.gz
 ```
 
-`-memprofilerate` controls the mean bytes allocated per heap sample, defaulting to `524288` for 512 KiB just like Go's `runtime.MemProfileRate`. Passing `-memprofilerate 1` records every heap allocation. Custom profilers can also hook into [`Suite::with_profiler`](https://github.com/bwplotka/benchfmt.rs/blob/main/src/lib.rs#L914-L917) via the zero-dependency [`Profiler`](https://github.com/bwplotka/benchfmt.rs/blob/main/src/lib.rs#L679-L690) trait.
+`-memprofilerate` controls the mean bytes allocated per heap sample, defaulting to `524288` for 512 KiB just like Go's `runtime.MemProfileRate`. Passing `-memprofilerate 1` records every heap allocation. Custom profilers can also hook into [`Suite::with_profiler`](https://github.com/bwplotka/benchfmt.rs/blob/main/src/lib.rs#L923-L926) via the zero-dependency [`Profiler`](https://github.com/bwplotka/benchfmt.rs/blob/main/src/lib.rs#L684-L695) trait.
 
 ##### Scope compared to Go's `testing.B`
 
