@@ -411,6 +411,7 @@ Cargo / libtest options:
   --list                                  List benchmarks without running them.
   --exact                                 Require exact benchmark name match.
   --skip PATTERN                          Skip benchmarks matching PATTERN.
+  --ignored                               Skip non-ignored benchmarks (libtest compatibility).
   --test                                  Run 1 iteration per benchmark as a smoke test.
   -h, --help                              Print this help text.
 ";
@@ -436,8 +437,8 @@ pub struct BenchConfig {
     pub pkg_override: Option<String>,
     /// List benchmark names without running them (`--list`).
     pub list_only: bool,
-    /// Run a single-iteration smoke test without emitting measurement epochs (`--test` compatibility
-    /// executes `1x` epoch per benchmark).
+    /// Run a single-iteration smoke test (`--test` compatibility executes one `1x` epoch per
+    /// benchmark).
     pub test_mode: bool,
     /// Skip all non-ignored benchmarks (`--ignored` `libtest` compatibility).
     pub run_ignored_only: bool,
@@ -927,8 +928,8 @@ impl<'a> Suite<'a> {
         self
     }
 
-    /// Attaches a global [`AllocTracker`] (such as [`CountingAlloc`]) so `B/op` and `allocs/op`
-    /// can be measured.
+    /// Attaches a global [`AllocTracker`] (such as [`CountingAlloc`] or [`ProcessAlloc`]) so
+    /// `B/op` and `allocs/op` can be measured.
     #[must_use]
     pub fn with_alloc(mut self, tracker: &'a dyn AllocTracker) -> Self {
         self.alloc_tracker = Some(tracker);
