@@ -33,14 +33,20 @@ const CPU_SAMPLE_FREQUENCY_HZ: i32 = 99;
 /// sampling state are process-wide resources.
 static SESSION_LOCK: Mutex<()> = Mutex::new(());
 
+/// Monotonic generation bumped on every [`PprofSession::new`] so per-thread sampling state resets
+/// cleanly when `-memprofilerate` changes across runs.
+static SESSION_GEN: AtomicU64 = AtomicU64::new(1);
+
 /// Active Poisson mean byte interval (`0` means heap sampling is disabled).
 static HEAP_SAMPLE_RATE: AtomicUsize = AtomicUsize::new(0);
 static RNG_SEED_COUNTER: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 #[derive(Default)]
 struct HeapSampleValue {
-    alloc_objects: i64,
-    alloc_space: i64,
+    // Accumulate exact unrounded Poisson estimates and round once when emitting `profile.proto` so
+    // half-integer scale factors (`1.5x`) do not suffer systematic per-sample rounding bias.
+    alloc_objects: f64,
+    alloc_space: f64,
     symbol_addrs: Box<[usize]>,
 }
 
@@ -50,6 +56,8 @@ static HEAP_SAMPLES: Mutex<Option<HashMap<Box<[usize]>, HeapSampleValue>>> = Mut
 struct ThreadHeapState {
     in_sample: bool,
     initialized: bool,
+    session_gen: u64,
+    rate: usize,
     bytes_until_sample: u64,
     rng: u64,
 }
@@ -60,6 +68,8 @@ thread_local! {
         Cell::new(ThreadHeapState {
             in_sample: false,
             initialized: false,
+            session_gen: 0,
+            rate: 0,
             bytes_until_sample: 0,
             rng: 0,
         })
@@ -87,6 +97,10 @@ pub(crate) fn maybe_record_heap_alloc(bytes: usize) {
 }
 
 fn slow_check_heap_sample(bytes: usize, rate: usize) {
+    // Synchronize with `HEAP_SAMPLE_RATE` `Release` stores so `SESSION_GEN` is never stale on
+    // weakly-ordered architectures while keeping the disabled fast path barrier-free.
+    std::sync::atomic::fence(Ordering::Acquire);
+    let current_gen = SESSION_GEN.load(Ordering::Relaxed);
     let should_sample = THREAD_HEAP_STATE
         .try_with(|cell| {
             let mut st = cell.get();
@@ -98,12 +112,16 @@ fn slow_check_heap_sample(bytes: usize, rate: usize) {
                     .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
                     .max(1);
                 st.rng = splitmix64(seed);
+                st.initialized = true;
+            }
+            if st.session_gen != current_gen || st.rate != rate {
+                st.session_gen = current_gen;
+                st.rate = rate;
                 st.bytes_until_sample = if rate <= 1 {
                     0
                 } else {
                     next_exponential_bytes(&mut st.rng, rate)
                 };
-                st.initialized = true;
             }
 
             let size = bytes as u64;
@@ -162,13 +180,16 @@ fn capture_heap_sample(bytes: usize, rate: usize) {
         return;
     }
 
-    // `try_lock` keeps sampling non-blocking and deadlock-free inside `GlobalAlloc`.
-    if let Ok(mut guard) = HEAP_SAMPLES.try_lock()
-        && let Some(map) = guard.as_mut()
-    {
+    // NOTE: `st.in_sample` (`ResetInSampleGuard`) suppresses allocator re-entrancy on this thread
+    // and `SIGPROF` never touches `HEAP_SAMPLES`, so a blocking lock is deadlock-free and avoids
+    // dropping concurrent worker-thread samples under `ProcessAlloc`.
+    let mut guard = HEAP_SAMPLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(map) = guard.as_mut() {
         if let Some(entry) = map.get_mut(&ips[..len]) {
-            entry.alloc_objects = entry.alloc_objects.saturating_add(scaled_objects);
-            entry.alloc_space = entry.alloc_space.saturating_add(scaled_space);
+            entry.alloc_objects += scaled_objects;
+            entry.alloc_space += scaled_space;
         } else {
             map.insert(
                 ips[..len].into(),
@@ -184,16 +205,14 @@ fn capture_heap_sample(bytes: usize, rate: usize) {
 
 /// Scales a sampled allocation of `bytes` under Poisson byte rate `rate` using Go's unbiased
 /// `1 / (1 - exp(-bytes / rate))` estimator (`runtime/pprof` `scaleHeapSample`).
-fn scale_heap_sample(bytes: usize, rate: usize) -> (i64, i64) {
+fn scale_heap_sample(bytes: usize, rate: usize) -> (f64, f64) {
     if rate <= 1 {
-        return (1, bytes as i64);
+        return (1.0, bytes as f64);
     }
     let ratio = (bytes as f64) / (rate as f64);
     let prob = -(-ratio).exp_m1();
     let scale = if prob > 0.0 { 1.0 / prob } else { 1.0 };
-    let objects = scale.round() as i64;
-    let space = ((bytes as f64) * scale).round() as i64;
-    (objects.max(1), space.max(bytes as i64))
+    (scale.max(1.0), ((bytes as f64) * scale).max(bytes as f64))
 }
 
 fn next_exponential_bytes(rng: &mut u64, rate: usize) -> u64 {
@@ -221,10 +240,12 @@ fn xorshift64_star(state: &mut u64) -> u64 {
 
 /// Built-in [`Profiler`] session managing `-cpuprofile` and `-memprofile` across a [`crate::Suite`].
 pub(crate) struct PprofSession {
-    _lock: MutexGuard<'static, ()>,
     #[cfg(unix)]
     cpu: Option<CpuCollector>,
     mem: Option<MemCollector>,
+    // Keep `_lock` as the last field so `cpu` (`ProfilerGuard`) and `mem` are always dropped
+    // before `SESSION_LOCK` is released.
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl PprofSession {
@@ -244,6 +265,7 @@ impl PprofSession {
         let lock = SESSION_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SESSION_GEN.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(unix)]
         let cpu = cfg
@@ -268,40 +290,46 @@ impl PprofSession {
         };
 
         Ok(Some(Self {
-            _lock: lock,
             #[cfg(unix)]
             cpu,
             mem,
+            _lock: lock,
         }))
     }
 }
 
 impl Drop for PprofSession {
     fn drop(&mut self) {
-        HEAP_SAMPLE_RATE.store(0, Ordering::Relaxed);
-        if let Ok(mut guard) = HEAP_SAMPLES.lock() {
-            *guard = None;
+        let _suppress = SuppressHeapGuard::enter();
+        HEAP_SAMPLE_RATE.store(0, Ordering::Release);
+        #[cfg(unix)]
+        {
+            self.cpu = None;
         }
+        self.mem = None;
+        *HEAP_SAMPLES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
 impl Profiler for PprofSession {
     fn start_bench(&mut self, _bench_name: &str) -> io::Result<()> {
-        // NOTE: Start the CPU profiler before enabling heap sampling so `pprof`'s internal DWARF
-        // and ring-buffer allocations never pollute `-memprofile`.
+        // NOTE: Start the CPU profiler before enabling heap sampling so `pprof`'s internal
+        // ring-buffer allocations never pollute `-memprofile`.
         #[cfg(unix)]
         if let Some(cpu) = &mut self.cpu {
             cpu.start_window()?;
         }
         if let Some(mem) = &mut self.mem {
             mem.active_since = Some(Instant::now());
-            HEAP_SAMPLE_RATE.store(mem.rate, Ordering::Relaxed);
+            HEAP_SAMPLE_RATE.store(mem.rate, Ordering::Release);
         }
         Ok(())
     }
 
     fn stop_bench(&mut self, _bench_name: &str) -> io::Result<()> {
-        HEAP_SAMPLE_RATE.store(0, Ordering::Relaxed);
+        HEAP_SAMPLE_RATE.store(0, Ordering::Release);
         if let Some(mem) = &mut self.mem
             && let Some(since) = mem.active_since.take()
         {
@@ -315,7 +343,7 @@ impl Profiler for PprofSession {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        HEAP_SAMPLE_RATE.store(0, Ordering::Relaxed);
+        HEAP_SAMPLE_RATE.store(0, Ordering::Release);
         #[cfg(unix)]
         if let Some(cpu) = &mut self.cpu {
             cpu.write_profile()?;
@@ -336,23 +364,32 @@ pub(crate) struct CombinedProfiler<'a> {
 
 impl Profiler for CombinedProfiler<'_> {
     fn start_bench(&mut self, bench_name: &str) -> io::Result<()> {
-        if let Some(b) = self.builtin.as_deref_mut() {
-            b.start_bench(bench_name)?;
-        }
+        // Start `custom` before `builtin` so any allocations inside `custom.start_bench` happen
+        // before `HEAP_SAMPLE_RATE` is armed, and roll back `custom` if `builtin` fails.
         if let Some(c) = self.custom.as_deref_mut() {
             c.start_bench(bench_name)?;
+        }
+        if let Some(b) = self.builtin.as_deref_mut()
+            && let Err(err) = b.start_bench(bench_name)
+        {
+            if let Some(c) = self.custom.as_deref_mut() {
+                let _ = c.stop_bench(bench_name);
+            }
+            return Err(err);
         }
         Ok(())
     }
 
     fn stop_bench(&mut self, bench_name: &str) -> io::Result<()> {
-        let r1 = if let Some(c) = self.custom.as_deref_mut() {
-            c.stop_bench(bench_name)
+        // Disarm `builtin` first so `custom.stop_bench` allocations are not sampled into
+        // `-memprofile`.
+        let r1 = if let Some(b) = self.builtin.as_deref_mut() {
+            b.stop_bench(bench_name)
         } else {
             Ok(())
         };
-        let r2 = if let Some(b) = self.builtin.as_deref_mut() {
-            b.stop_bench(bench_name)
+        let r2 = if let Some(c) = self.custom.as_deref_mut() {
+            c.stop_bench(bench_name)
         } else {
             Ok(())
         };
@@ -384,6 +421,7 @@ struct MemCollector {
 
 impl MemCollector {
     fn write_profile(&mut self) -> io::Result<()> {
+        let _suppress = SuppressHeapGuard::enter();
         let samples = HEAP_SAMPLES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -407,36 +445,74 @@ impl MemCollector {
                 if ip == 0 {
                     continue;
                 }
-                // All frames captured inside `capture_heap_sample` are return addresses, so
-                // `ip - 1` points inside the calling instruction for accurate line resolution.
-                let lookup_ip = ip.saturating_sub(1);
+                // NOTE: `backtrace::resolve` internally subtracts 1 from return addresses, so pass
+                // the raw `ip` for symbolication while storing `ip - 1` as `Location.address`.
                 let syms = resolved_cache
-                    .entry(lookup_ip)
-                    .or_insert_with(|| resolve_ip(lookup_ip, val.symbol_addrs.get(idx).copied()))
+                    .entry(ip)
+                    .or_insert_with(|| resolve_return_ip(ip, val.symbol_addrs.get(idx).copied()))
                     .clone();
-                frame_symbols.push((lookup_ip as u64, syms));
+                frame_symbols.push((ip.saturating_sub(1) as u64, syms));
             }
 
-            // Strip internal allocator-wrapper and backtrace capture frames from the leaf so the
-            // top of `go tool pprof` points at the benchmark's allocation site.
-            let skip = frame_symbols
-                .iter()
-                .position(|(_, syms)| !syms.iter().any(is_internal_heap_frame))
-                .unwrap_or(0);
-            let trimmed = &frame_symbols[skip..];
+            strip_internal_heap_frames(&mut frame_symbols);
 
-            let mut loc_ids = Vec::with_capacity(trimmed.len());
-            for (addr, syms) in trimmed {
+            let mut loc_ids = Vec::with_capacity(frame_symbols.len());
+            for (addr, syms) in &frame_symbols {
                 loc_ids.push(builder.intern_location(*addr, syms));
             }
-            builder.add_sample(loc_ids, vec![val.alloc_objects, val.alloc_space], &[]);
+            let objects = (val.alloc_objects.round() as i64).max(1);
+            let space = (val.alloc_space.round() as i64).max(1);
+            builder.add_sample(loc_ids, vec![objects, space], &[]);
         }
 
         builder.write_gzipped(&self.path)
     }
 }
 
-fn resolve_ip(lookup_ip: usize, fallback_sym_addr: Option<usize>) -> Vec<ResolvedSymbol> {
+/// Strips internal unwinder, `pprof_support`, `CountingAlloc`, and `alloc::alloc` wrapper frames
+/// from the leaf of a heap sample while preserving user functions into which `alloc::alloc::*`
+/// was inlined (such as `Box::new` under `--release` with `debug = 1`).
+fn strip_internal_heap_frames(frame_symbols: &mut Vec<(u64, Vec<ResolvedSymbol>)>) {
+    let mut idx = 0usize;
+    let mut skip = 0usize;
+    while idx < frame_symbols.len() {
+        let syms = &frame_symbols[idx].1;
+        if syms.is_empty() {
+            idx += 1;
+        } else if syms.iter().all(is_internal_heap_frame) {
+            idx += 1;
+            skip = idx;
+        } else {
+            if syms.iter().any(is_internal_heap_frame) {
+                skip = idx;
+            }
+            break;
+        }
+    }
+    if skip > 0 && skip < frame_symbols.len() {
+        frame_symbols.drain(..skip);
+    }
+    if let Some((_, first_syms)) = frame_symbols.first_mut() {
+        let inline_skip = first_syms
+            .iter()
+            .position(|s| !is_internal_heap_frame(s))
+            .unwrap_or(0);
+        if inline_skip > 0 && inline_skip < first_syms.len() {
+            first_syms.drain(..inline_skip);
+        }
+    }
+}
+
+// NOTE: `backtrace::resolve` subtracts 1 from `addr` on `gimli` targets (`mod.rs` `adjust_ip`),
+// whereas `backtrace`'s Windows MSVC `dbghelp` backend (`dbghelp.rs`) calls `adjust_ip` twice on
+// `ResolveWhat::Address`, subtracting 2. Adding `EXACT_PC_RESOLVE_OFFSET` lands on `addr` itself
+// when resolving a function entry address or an exact interrupted `PC`.
+#[cfg(all(windows, target_env = "msvc", not(target_vendor = "uwp")))]
+const EXACT_PC_RESOLVE_OFFSET: usize = 2;
+#[cfg(not(all(windows, target_env = "msvc", not(target_vendor = "uwp"))))]
+const EXACT_PC_RESOLVE_OFFSET: usize = 1;
+
+fn resolve_return_ip(return_ip: usize, fallback_sym_addr: Option<usize>) -> Vec<ResolvedSymbol> {
     let mut out = Vec::new();
     let collect = |symbol: &backtrace::Symbol, dst: &mut Vec<ResolvedSymbol>| {
         let (name, system_name) = match symbol.name() {
@@ -461,24 +537,50 @@ fn resolve_ip(lookup_ip: usize, fallback_sym_addr: Option<usize>) -> Vec<Resolve
         }
     };
 
-    backtrace::resolve(lookup_ip as *mut c_void, |sym| collect(sym, &mut out));
+    backtrace::resolve(return_ip as *mut c_void, |sym| collect(sym, &mut out));
     if out.is_empty()
         && let Some(sym_addr) = fallback_sym_addr
         && sym_addr != 0
     {
-        backtrace::resolve(sym_addr as *mut c_void, |sym| collect(sym, &mut out));
+        // Offset `sym_addr` by `EXACT_PC_RESOLVE_OFFSET` so `backtrace::resolve`'s internal
+        // return-address decrement lands on the function's entry byte rather than the preceding
+        // function.
+        backtrace::resolve(
+            sym_addr.saturating_add(EXACT_PC_RESOLVE_OFFSET) as *mut c_void,
+            |sym| {
+                collect(sym, &mut out);
+            },
+        );
     }
     out
 }
 
 fn is_internal_heap_frame(sym: &ResolvedSymbol) -> bool {
     let n = sym.name.as_str();
-    n.starts_with("backtrace::")
-        || n.starts_with("benchfmt::pprof_support::")
-        || n.starts_with("benchfmt::alloc::")
-        || n.starts_with("<benchfmt::alloc::")
+    // Strip leading `<` / `&` so Rust v0-mangled inherent and trait impls such as
+    // `<alloc::alloc::Global>::alloc_impl_runtime` and `<std::alloc::System>::alloc_impl` match
+    // alongside free functions like `alloc::alloc::alloc`.
+    let norm = n.trim_start_matches(['<', '&']);
+    // In Windows CodeView PDBs, `#[global_allocator]` shims lack `DW_AT_linkage_name` and resolve
+    // via their parent module path (`<crate>::_::__rust_alloc` or `<crate>::_::__rg_alloc`) rather
+    // than `__rustc::__rust_alloc`. Require a leading `_` on the leaf identifier so user functions
+    // named `rust_alloc*` are never stripped.
+    let raw_leaf = n.rsplit("::").next().unwrap_or(n);
+    let is_compiler_alloc_shim = raw_leaf.starts_with('_') && {
+        let leaf = raw_leaf.trim_start_matches('_');
+        leaf.starts_with("rust_alloc")
+            || leaf.starts_with("rust_realloc")
+            || leaf.starts_with("rg_alloc")
+            || leaf.starts_with("rg_realloc")
+    };
+    norm.starts_with("backtrace::")
+        || norm.starts_with("benchfmt::pprof_support::")
+        || norm.starts_with("benchfmt::alloc::")
         || n.starts_with("__rustc::__rust_")
-        || n.starts_with("alloc::alloc::")
+        || is_compiler_alloc_shim
+        || norm.starts_with("alloc::alloc::")
+        || norm.starts_with("core::alloc::")
+        || norm.starts_with("std::alloc::")
 }
 
 #[cfg(unix)]
@@ -486,7 +588,7 @@ struct CpuCollector {
     path: PathBuf,
     builder: pprof::ProfilerGuardBuilder,
     active: Option<(pprof::ProfilerGuard<'static>, Instant)>,
-    samples: HashMap<pprof::Frames, i64>,
+    reports: Vec<pprof::UnresolvedReport>,
     started_at: SystemTime,
     total_duration: Duration,
 }
@@ -501,13 +603,25 @@ impl CpuCollector {
             target_arch = "riscv64",
             target_arch = "loongarch64"
         ))]
-        let builder = builder.blocklist(&["libc", "libgcc", "pthread", "vdso"]);
+        let builder = builder.blocklist(&[
+            "libc",
+            "libgcc",
+            "pthread",
+            "vdso",
+            "ld-linux",
+            "ld-musl",
+            "ld.so",
+            "libsystem",
+            "libdyld",
+            "dyld",
+            "libunwind",
+        ]);
 
         Self {
             path,
             builder,
             active: None,
-            samples: HashMap::new(),
+            reports: Vec::new(),
             started_at: SystemTime::now(),
             total_duration: Duration::ZERO,
         }
@@ -525,28 +639,36 @@ impl CpuCollector {
     }
 
     fn stop_window(&mut self) -> io::Result<()> {
+        // NOTE: Enter `SuppressHeapGuard` before taking `guard` so `ProfilerGuard::drop` stays
+        // hidden from `CountingAlloc` and `ProcessAlloc` even if `build_unresolved` returns `Err`.
+        let _suppress = SuppressHeapGuard::enter();
         let Some((guard, started)) = self.active.take() else {
             return Ok(());
         };
         self.total_duration += started.elapsed();
-        // NOTE: Keep `in_sample` set while building the report and dropping `guard` so any
-        // internal allocations stay hidden from `CountingAlloc`.
-        let _suppress = SuppressHeapGuard::enter();
         let report = guard
             .report()
-            .build()
+            .build_unresolved()
             .map_err(|e| io::Error::other(format!("failed harvesting CPU samples: {e}")))?;
-        for (resolved, count) in report.data {
-            if count > 0 {
-                *self.samples.entry(resolved).or_insert(0) += count as i64;
-            }
-        }
+        self.reports.push(report);
         drop(guard);
         Ok(())
     }
 
     fn write_profile(&mut self) -> io::Result<()> {
         let _suppress = SuppressHeapGuard::enter();
+        // Aggregate raw `UnresolvedFrames` across all calibration steps and epochs before
+        // symbolizing, preserving runtime instruction pointers (`frame.ip()`) that
+        // `pprof::Frames::from` discards when compiled with `-C debuginfo=1` (line tables only).
+        let mut raw_samples = HashMap::new();
+        for report in self.reports.drain(..) {
+            for (unresolved, count) in report.data {
+                if count > 0 {
+                    *raw_samples.entry(unresolved).or_insert(0i64) += count as i64;
+                }
+            }
+        }
+
         let period_ns = 1_000_000_000i64 / i64::from(CPU_SAMPLE_FREQUENCY_HZ);
         let mut builder = ProfileBuilder::new(
             &[("samples", "count"), ("cpu", "nanoseconds")],
@@ -557,36 +679,97 @@ impl CpuCollector {
             self.total_duration,
         );
 
-        for (frames, count) in &self.samples {
-            if *count <= 0 {
+        let mut resolved_cache: HashMap<usize, Vec<ResolvedSymbol>> = HashMap::new();
+
+        for (unresolved, count) in raw_samples {
+            if count <= 0 {
                 continue;
             }
-            let mut loc_ids = Vec::with_capacity(frames.frames.len());
-            for inline_syms in &frames.frames {
-                let addr = inline_syms
-                    .last()
-                    .and_then(|s| s.addr)
-                    .map(|p| p as usize as u64)
-                    .unwrap_or(0);
-                let syms: Vec<ResolvedSymbol> = inline_syms
-                    .iter()
-                    .map(|s| ResolvedSymbol {
-                        name: s.name(),
-                        system_name: s.sys_name().into_owned(),
-                        filename: s
-                            .filename
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        lineno: s.lineno(),
+            let mut frame_symbols = Vec::with_capacity(unresolved.frames.len());
+            let mut frame_iter = unresolved.frames.iter();
+            let mut next_is_interrupted_pc = false;
+            while let Some(frame) = frame_iter.next() {
+                #[cfg(all(
+                    target_os = "macos",
+                    any(
+                        target_arch = "x86_64",
+                        target_arch = "aarch64",
+                        target_arch = "riscv64",
+                        target_arch = "loongarch64"
+                    )
+                ))]
+                let (ip, sym_addr) = (frame.ip, 0usize);
+                #[cfg(not(all(
+                    target_os = "macos",
+                    any(
+                        target_arch = "x86_64",
+                        target_arch = "aarch64",
+                        target_arch = "riscv64",
+                        target_arch = "loongarch64"
+                    )
+                )))]
+                let (ip, sym_addr) = (frame.ip() as usize, frame.symbol_address() as usize);
+                if ip == 0 {
+                    continue;
+                }
+                // The single frame unwound across the OS signal trampoline (`__restore_rt`) holds
+                // the exact interrupted `PC` rather than a post-`call` return address; add
+                // `EXACT_PC_RESOLVE_OFFSET` before `backtrace::resolve` and store `ip` directly.
+                let exact_pc = std::mem::take(&mut next_is_interrupted_pc);
+                let lookup_ip = if exact_pc {
+                    ip.saturating_add(EXACT_PC_RESOLVE_OFFSET)
+                } else {
+                    ip
+                };
+                let syms = resolved_cache
+                    .entry(lookup_ip)
+                    .or_insert_with(|| {
+                        resolve_return_ip(lookup_ip, (sym_addr != 0).then_some(sym_addr))
                     })
-                    .collect();
-                loc_ids.push(builder.intern_location(addr, &syms));
+                    .clone();
+
+                // Strip `pprof`'s `SIGPROF` handler, any unwinder frames captured above it, and
+                // the OS signal return trampoline frame immediately below it (`__restore_rt`).
+                if syms.iter().any(|sym| {
+                    matches!(
+                        sym.name.as_str(),
+                        "perf_signal_handler" | "_perf_signal_handler"
+                    ) || matches!(
+                        sym.system_name.as_str(),
+                        "perf_signal_handler" | "_perf_signal_handler"
+                    )
+                }) {
+                    frame_symbols.clear();
+                    frame_iter.next();
+                    next_is_interrupted_pc = true;
+                    continue;
+                }
+
+                let loc_addr = if exact_pc {
+                    ip as u64
+                } else {
+                    ip.saturating_sub(1) as u64
+                };
+                frame_symbols.push((loc_addr, syms));
             }
-            let thread_label = frames.thread_name_or_id();
+
+            let mut loc_ids = Vec::with_capacity(frame_symbols.len());
+            for (addr, syms) in &frame_symbols {
+                loc_ids.push(builder.intern_location(*addr, syms));
+            }
+
+            let name_len = unresolved
+                .thread_name_length
+                .min(unresolved.thread_name.len());
+            let thread_name = String::from_utf8_lossy(&unresolved.thread_name[..name_len]);
+            let thread_label = if !thread_name.is_empty() {
+                thread_name.into_owned()
+            } else {
+                unresolved.thread_id.to_string()
+            };
             builder.add_sample(
                 loc_ids,
-                vec![*count, count.saturating_mul(period_ns)],
+                vec![count, count.saturating_mul(period_ns)],
                 &[("thread", thread_label.as_str())],
             );
         }
@@ -595,12 +778,10 @@ impl CpuCollector {
     }
 }
 
-#[cfg(unix)]
 struct SuppressHeapGuard {
     prev: bool,
 }
 
-#[cfg(unix)]
 impl SuppressHeapGuard {
     fn enter() -> Self {
         let prev = THREAD_HEAP_STATE
@@ -616,7 +797,6 @@ impl SuppressHeapGuard {
     }
 }
 
-#[cfg(unix)]
 impl Drop for SuppressHeapGuard {
     fn drop(&mut self) {
         let prev = self.prev;
@@ -625,5 +805,151 @@ impl Drop for SuppressHeapGuard {
             st.in_sample = prev;
             cell.set(st);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_heap_sample_preserves_fractional_expectations() {
+        assert_eq!(scale_heap_sample(2048, 1), (1.0, 2048.0));
+
+        // At `bytes = 576_000` and `rate = 524_288`, `scale` is ~1.49997; keeping `f64` avoids
+        // rounding every individual sample down to `1` (-33% bias).
+        let (objs, space) = scale_heap_sample(576_000, 524_288);
+        assert!((objs - 1.5).abs() < 0.01, "objs={objs}");
+        assert!((space - 576_000.0 * objs).abs() < 1.0, "space={space}");
+    }
+
+    #[test]
+    fn strip_internal_heap_frames_keeps_user_frame_with_inlined_alloc() {
+        let mk = |name: &str| ResolvedSymbol {
+            name: name.to_owned(),
+            system_name: name.to_owned(),
+            filename: "src/lib.rs".to_owned(),
+            lineno: 1,
+        };
+        let mut frames = vec![
+            // Symbolicated leaf unwinder frame followed by an unsymbolicated `_Unwind_Backtrace`
+            // frame in stripped `libgcc_s`.
+            (0x0fff, vec![mk("backtrace::backtrace::libunwind::trace")]),
+            (0x1000, Vec::new()),
+            // Internal wrapper frames.
+            (
+                0x1001,
+                vec![mk("benchfmt::pprof_support::capture_heap_sample")],
+            ),
+            (
+                0x1002,
+                vec![mk(
+                    "<benchfmt::alloc::CountingAlloc as core::alloc::global::GlobalAlloc>::alloc",
+                )],
+            ),
+            // Windows CodeView PDB `#[global_allocator]` shim scoped under the test crate.
+            (0x1003, vec![mk("pprof::_::__rust_alloc")]),
+            // User physical frame where `<alloc::alloc::Global>::alloc_impl_runtime` and
+            // `alloc::alloc::alloc` were inlined via `Box::new`.
+            (
+                0x2000,
+                vec![
+                    mk("<std::alloc::System>::alloc_impl"),
+                    mk("<alloc::alloc::Global>::alloc_impl_runtime"),
+                    mk("alloc::alloc::alloc"),
+                    mk("alloc::alloc::exchange_malloc"),
+                    mk("alloc::boxed::Box<T>::new"),
+                    mk("my_crate::rust_alloc_benchmark"),
+                ],
+            ),
+            (0x3000, vec![mk("my_crate::caller")]),
+        ];
+
+        strip_internal_heap_frames(&mut frames);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, 0x2000);
+        assert_eq!(frames[0].1.len(), 2);
+        assert_eq!(frames[0].1[0].name, "alloc::boxed::Box<T>::new");
+        assert_eq!(frames[0].1[1].name, "my_crate::rust_alloc_benchmark");
+
+        // Unsymbolicated leaf frame directly preceding a mixed inline user frame is drained.
+        let mut unsym_before_mixed = vec![
+            (0x1000, Vec::new()),
+            (
+                0x2000,
+                vec![
+                    mk("<alloc::alloc::Global>::alloc_impl_runtime"),
+                    mk("my_crate::f"),
+                ],
+            ),
+        ];
+        strip_internal_heap_frames(&mut unsym_before_mixed);
+        assert_eq!(unsym_before_mixed.len(), 1);
+        assert_eq!(unsym_before_mixed[0].0, 0x2000);
+        assert_eq!(unsym_before_mixed[0].1.len(), 1);
+        assert_eq!(unsym_before_mixed[0].1[0].name, "my_crate::f");
+
+        // Leading unsymbolicated user frames are preserved when not followed by internal frames.
+        let mut user_unsymbolicated = vec![(0x4000, Vec::new()), (0x5000, vec![mk("my_crate::f")])];
+        strip_internal_heap_frames(&mut user_unsymbolicated);
+        assert_eq!(user_unsymbolicated.len(), 2);
+
+        // All-internal stacks are never drained to empty.
+        let mut all_internal = vec![(
+            0x1001,
+            vec![mk("benchfmt::pprof_support::capture_heap_sample")],
+        )];
+        strip_internal_heap_frames(&mut all_internal);
+        assert_eq!(all_internal.len(), 1);
+    }
+
+    #[inline(never)]
+    fn interrupted_entry_probe(x: u64) -> (u64, usize) {
+        #[cfg(all(windows, target_env = "msvc", not(target_vendor = "uwp")))]
+        let entry = {
+            // Under MSVC `/INCREMENTAL`, a Rust fn pointer can point to an ILT jump thunk rather
+            // than the function body; query `dbghelp` (`SYMBOL_INFOW.Address`) from an active
+            // stack frame so the test always probes the real entry byte.
+            let mut resolved = interrupted_entry_probe as *const () as usize;
+            backtrace::trace(|frame| {
+                let mut found = None;
+                backtrace::resolve_frame(frame, |sym| {
+                    if let Some(name) = sym.name()
+                        && format!("{name:#}").contains("interrupted_entry_probe")
+                        && let Some(addr) = sym.addr()
+                    {
+                        found = Some(addr as usize);
+                    }
+                });
+                if let Some(addr) = found {
+                    resolved = addr;
+                    return false;
+                }
+                true
+            });
+            resolved
+        };
+        #[cfg(not(all(windows, target_env = "msvc", not(target_vendor = "uwp"))))]
+        let entry = interrupted_entry_probe as *const () as usize;
+        (std::hint::black_box(x).wrapping_add(1), entry)
+    }
+
+    #[test]
+    fn exact_pc_offset_resolves_function_entry_byte() {
+        let (out, entry_pc) = interrupted_entry_probe(41);
+        assert_eq!(out, 42);
+        let syms = resolve_return_ip(entry_pc.saturating_add(EXACT_PC_RESOLVE_OFFSET), None);
+        assert!(
+            syms.iter()
+                .any(|s| s.name.contains("interrupted_entry_probe")),
+            "expected function entry byte to resolve to interrupted_entry_probe, got {syms:?}"
+        );
+        let fallback_syms = resolve_return_ip(1, Some(entry_pc));
+        assert!(
+            fallback_syms
+                .iter()
+                .any(|s| s.name.contains("interrupted_entry_probe")),
+            "expected fallback_sym_addr to resolve function entry byte, got {fallback_syms:?}"
+        );
     }
 }

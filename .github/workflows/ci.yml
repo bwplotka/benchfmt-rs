@@ -24,10 +24,44 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Run clippy (pprof)
         run: cargo clippy --all-targets --features pprof -- -D warnings
+      - name: Check rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features
       - name: Run tests (default)
         run: cargo test
       - name: Run tests (pprof)
         run: cargo test --features pprof
+      - name: Run release tests with line-table debuginfo (pprof)
+        env:
+          RUSTFLAGS: -C debuginfo=1
+        run: cargo test --release --features pprof
+
+  cross-platform:
+    name: Cross-platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run clippy (default)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run clippy (pprof)
+        run: cargo clippy --all-targets --features pprof -- -D warnings
+      - name: Run tests (default)
+        run: cargo test
+      - name: Run tests (pprof)
+        run: cargo test --features pprof
+      - name: Run release tests with line-table debuginfo (pprof)
+        env:
+          RUSTFLAGS: -C debuginfo=1
+        run: cargo test --release --features pprof
 
   msrv:
     name: MSRV (1.88)
@@ -36,7 +70,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
-      - name: Check MSRV (default)
-        run: cargo check --all-targets
-      - name: Check MSRV (pprof)
-        run: cargo check --all-targets --features pprof
+      - name: Run tests on MSRV (default)
+        run: cargo test
+      - name: Run tests on MSRV (pprof)
+        run: cargo test --features pprof

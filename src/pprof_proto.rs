@@ -228,47 +228,17 @@ impl ProfileBuilder {
             .ok()
             .and_then(|p| fs::canonicalize(&p).ok().or(Some(p)))
             .map(|p| p.to_string_lossy().into_owned());
+        self.populate_mappings(&maps, exe_path.as_deref());
+    }
 
-        let mut parsed = Vec::new();
-        for line in maps.lines() {
-            let mut parts = line.split_whitespace();
-            let Some(range) = parts.next() else { continue };
-            let Some(perms) = parts.next() else { continue };
-            if !perms.contains('x') {
-                continue;
-            }
-            let Some(offset_hex) = parts.next() else {
-                continue;
-            };
-            let _dev = parts.next();
-            let _inode = parts.next();
-            let pathname = parts.collect::<Vec<_>>().join(" ");
-            if !pathname.starts_with('/') {
-                continue;
-            }
-            let Some((start_hex, end_hex)) = range.split_once('-') else {
-                continue;
-            };
-            let (Ok(start), Ok(limit), Ok(offset)) = (
-                u64::from_str_radix(start_hex, 16),
-                u64::from_str_radix(end_hex, 16),
-                u64::from_str_radix(offset_hex, 16),
-            ) else {
-                continue;
-            };
-            let is_main = exe_path.as_deref() == Some(pathname.as_str());
-            parsed.push((is_main, start, limit, offset, pathname));
-        }
-
-        // `profile.proto` places the main executable at `mapping[0]`.
-        parsed.sort_by_key(|(is_main, start, ..)| (!*is_main, *start));
-        for (idx, (_, start, limit, offset, pathname)) in parsed.into_iter().enumerate() {
-            let filename = self.intern(&pathname);
+    fn populate_mappings(&mut self, maps: &str, exe_path: Option<&str>) {
+        for (idx, m) in parse_proc_maps(maps, exe_path).into_iter().enumerate() {
+            let filename = self.intern(&m.pathname);
             self.mappings.push(MappingEntry {
                 id: (idx + 1) as u64,
-                memory_start: start,
-                memory_limit: limit,
-                file_offset: offset,
+                memory_start: m.start,
+                memory_limit: m.limit,
+                file_offset: m.offset,
                 filename,
                 has_functions: false,
                 has_filenames: false,
@@ -383,6 +353,58 @@ impl ProfileBuilder {
     }
 }
 
+struct ParsedMap {
+    start: u64,
+    limit: u64,
+    offset: u64,
+    pathname: String,
+}
+
+fn parse_proc_maps(maps: &str, exe_path: Option<&str>) -> Vec<ParsedMap> {
+    let mut exec_rows = Vec::new();
+    for line in maps.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(range) = parts.next() else { continue };
+        let Some(perms) = parts.next() else { continue };
+        if !perms.contains('x') {
+            continue;
+        }
+        let Some(offset_hex) = parts.next() else {
+            continue;
+        };
+        let _dev = parts.next();
+        let _inode = parts.next();
+        let pathname = parts.collect::<Vec<_>>().join(" ");
+        if !pathname.starts_with('/') {
+            continue;
+        }
+        let Some((start_hex, end_hex)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(limit), Ok(offset)) = (
+            u64::from_str_radix(start_hex, 16),
+            u64::from_str_radix(end_hex, 16),
+            u64::from_str_radix(offset_hex, 16),
+        ) else {
+            continue;
+        };
+        let is_main = exe_path == Some(pathname.as_str());
+        exec_rows.push((is_main, start, limit, offset, pathname));
+    }
+
+    // `profile.proto` places the main executable at `mapping[0]`.
+    exec_rows.sort_by_key(|(is_main, start, ..)| (!*is_main, *start));
+    exec_rows
+        .into_iter()
+        .map(|(_, start, limit, offset, pathname)| ParsedMap {
+            start,
+            limit,
+            offset,
+            pathname,
+        })
+        .collect()
+}
+
 #[inline]
 fn encode_varint(out: &mut Vec<u8>, mut val: u64) {
     while val >= 0x80 {
@@ -443,4 +465,79 @@ fn encode_packed_i64_field(out: &mut Vec<u8>, field: u32, vals: &[i64]) {
         encode_varint(&mut payload, v as u64);
     }
     encode_bytes_field(out, field, &payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_maps_sorts_main_exe_first_and_preserves_mapping_capabilities() {
+        let maps = "\
+7f1000000000-7f1000020000 r-xp 00001000 08:01 10 /usr/lib/libc.so.6
+55b852302000-55b852337000 r--p 00000000 08:01 20 /tmp/my build/bench_bin
+55b852338000-55b8523db000 r-xp 00035000 08:01 20 /tmp/my build/bench_bin
+55b8523db000-55b8523dc000 r--p 000d8000 08:01 20 /tmp/my build/bench_bin
+7ffd00000000-7ffd00002000 r-xp 00000000 00:00 0 [vdso]
+";
+        let mut builder = ProfileBuilder {
+            strings: vec![String::new()],
+            string_idx: HashMap::from([(String::new(), 0)]),
+            sample_types: Vec::new(),
+            period_type: (0, 0),
+            period: 1,
+            default_sample_type: 0,
+            time_nanos: 0,
+            duration_nanos: 0,
+            mappings: Vec::new(),
+            functions: Vec::new(),
+            function_idx: HashMap::new(),
+            locations: Vec::new(),
+            location_idx: HashMap::new(),
+            samples: Vec::new(),
+        };
+        builder.populate_mappings(maps, Some("/tmp/my build/bench_bin"));
+        assert_eq!(builder.mappings.len(), 2);
+        assert_eq!(builder.mappings[0].memory_start, 0x55b8_5233_8000);
+        assert_eq!(builder.mappings[1].memory_start, 0x7f10_0000_0000);
+
+        let syms = [
+            ResolvedSymbol {
+                name: "inlined_callee".to_owned(),
+                system_name: "_ZN14inlined_calleeE".to_owned(),
+                filename: "src/lib.rs".to_owned(),
+                lineno: 10,
+            },
+            ResolvedSymbol {
+                name: "outer_caller".to_owned(),
+                system_name: "_ZN12outer_callerE".to_owned(),
+                filename: "src/lib.rs".to_owned(),
+                lineno: 25,
+            },
+        ];
+        let loc_id = builder.intern_location(0x55b8_5233_b493, &syms);
+        assert_eq!(loc_id, 1);
+        assert_eq!(builder.locations[0].mapping_id, 1);
+        assert_eq!(builder.locations[0].address, 0x55b8_5233_b493);
+        assert!(builder.mappings[0].has_functions);
+        assert!(builder.mappings[0].has_inline_frames);
+
+        // Unsymbolicated shared-library addresses keep `has_functions == false` so `go tool pprof`
+        // can still symbolize the library from disk.
+        let libc_loc = builder.intern_location(0x7f10_0000_0500, &[]);
+        assert_eq!(builder.locations[1].mapping_id, 2);
+        assert!(!builder.mappings[1].has_functions);
+
+        // Empty location samples are ignored; empty label values are omitted.
+        builder.add_sample(Vec::new(), vec![1], &[("thread", "main")]);
+        assert!(builder.samples.is_empty());
+        builder.add_sample(
+            vec![loc_id, libc_loc],
+            vec![5],
+            &[("empty", ""), ("thread", "main")],
+        );
+        assert_eq!(builder.samples.len(), 1);
+        assert_eq!(builder.samples[0].labels.len(), 1);
+        assert!(!builder.encode_proto().is_empty());
+    }
 }

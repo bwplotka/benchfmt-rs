@@ -89,8 +89,8 @@ impl BenchTime {
             let n = iters
                 .parse::<u64>()
                 .map_err(|_| format!("invalid iteration benchtime {raw:?}"))?;
-            if n == 0 {
-                return Err("iteration benchtime must be >= 1".to_owned());
+            if n == 0 || n > i64::MAX as u64 {
+                return Err("iteration benchtime must be in 1..=i64::MAX".to_owned());
             }
             return Ok(Self::Iterations(n));
         }
@@ -104,31 +104,45 @@ fn parse_duration(raw: &str) -> Result<Duration, String> {
         let v: f64 = ms
             .parse()
             .map_err(|_| format!("invalid duration {raw:?}"))?;
-        return Ok(Duration::from_secs_f64(v / 1_000.0));
+        return secs_to_nonzero_duration(v / 1_000.0, raw);
     }
     if let Some(us) = raw.strip_suffix("us").or_else(|| raw.strip_suffix("µs")) {
         let v: f64 = us
             .parse()
             .map_err(|_| format!("invalid duration {raw:?}"))?;
-        return Ok(Duration::from_secs_f64(v / 1_000_000.0));
+        return secs_to_nonzero_duration(v / 1_000_000.0, raw);
     }
     if let Some(ns) = raw.strip_suffix("ns") {
         let v: u64 = ns
             .parse()
             .map_err(|_| format!("invalid duration {raw:?}"))?;
+        if v == 0 {
+            return Err("duration benchtime must be > 0".to_owned());
+        }
         return Ok(Duration::from_nanos(v));
     }
     if let Some(m) = raw.strip_suffix('m') {
         let v: f64 = m.parse().map_err(|_| format!("invalid duration {raw:?}"))?;
-        return Ok(Duration::from_secs_f64(v * 60.0));
+        return secs_to_nonzero_duration(v * 60.0, raw);
     }
     if let Some(s) = raw.strip_suffix('s') {
         let v: f64 = s.parse().map_err(|_| format!("invalid duration {raw:?}"))?;
-        return Ok(Duration::from_secs_f64(v));
+        return secs_to_nonzero_duration(v, raw);
     }
     Err(format!(
         "unsupported duration unit in {raw:?} (expected ns, us, ms, s, m, or Nx)"
     ))
+}
+
+fn secs_to_nonzero_duration(secs: f64, raw: &str) -> Result<Duration, String> {
+    if !secs.is_finite() || secs <= 0.0 {
+        return Err(format!("invalid duration {raw:?} (must be finite and > 0)"));
+    }
+    let dur = Duration::try_from_secs_f64(secs).map_err(|_| format!("invalid duration {raw:?}"))?;
+    if dur.is_zero() {
+        return Err(format!("invalid duration {raw:?} (must be > 0)"));
+    }
+    Ok(dur)
 }
 
 /// Top-of-file Go `benchfmt` configuration metadata (`goos`, `goarch`, `pkg`, `cpu`).
@@ -171,32 +185,105 @@ impl BenchHeader {
         }
     }
 
-    /// Writes the configuration block in `benchfmt` format.
-    pub fn write(&self, mut out: impl Write) -> io::Result<()> {
-        writeln!(out, "goos: {}", self.goos)?;
-        writeln!(out, "goarch: {}", self.goarch)?;
-        writeln!(out, "pkg: {}", self.pkg)?;
+    fn validate(&self) -> io::Result<()> {
+        validate_header_kv("goos", &self.goos)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        validate_header_kv("goarch", &self.goarch)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        validate_header_kv("pkg", &self.pkg)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         if let Some(cpu) = &self.cpu {
-            writeln!(out, "cpu: {cpu}")?;
+            let trimmed_cpu = cpu.trim();
+            if !trimmed_cpu.is_empty() {
+                validate_header_kv("cpu", trimmed_cpu)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            }
         }
         for (k, v) in &self.extra {
-            writeln!(out, "{k}: {v}")?;
+            validate_header_kv(k, v).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        }
+        Ok(())
+    }
+
+    /// Writes the configuration block in `benchfmt` format.
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any header key violates Go's `benchfmt` key
+    /// grammar (lowercase start, no uppercase/whitespace/colons) or any value contains newlines or
+    /// is empty.
+    pub fn write(&self, mut out: impl Write) -> io::Result<()> {
+        self.validate()?;
+
+        writeln!(out, "goos: {}", self.goos.trim())?;
+        writeln!(out, "goarch: {}", self.goarch.trim())?;
+        writeln!(out, "pkg: {}", self.pkg.trim())?;
+        if let Some(cpu) = &self.cpu {
+            let trimmed_cpu = cpu.trim();
+            if !trimmed_cpu.is_empty() {
+                writeln!(out, "cpu: {trimmed_cpu}")?;
+            }
+        }
+        for (k, v) in &self.extra {
+            writeln!(out, "{k}: {}", v.trim())?;
         }
         Ok(())
     }
 }
 
+/// Validates a Go `benchfmt` `key: value` header pair (`golang.org/x/perf/benchfmt`).
+#[doc(hidden)]
+pub fn validate_header_kv(key: &str, value: &str) -> Result<(), String> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err("benchfmt header key must not be empty".to_owned());
+    };
+    if !first.is_lowercase() {
+        return Err(format!(
+            "benchfmt header key {key:?} must start with a lowercase letter"
+        ));
+    }
+    if chars.any(|c| c.is_uppercase() || c.is_whitespace() || c.is_control() || c == ':') {
+        return Err(format!(
+            "benchfmt header key {key:?} must not contain uppercase, whitespace, control characters, or ':'"
+        ));
+    }
+    if value.chars().any(|c| matches!(c, '\r' | '\n')) {
+        return Err(format!(
+            "benchfmt header value for {key:?} must not contain newlines"
+        ));
+    }
+    if value.trim().is_empty() {
+        return Err(format!(
+            "benchfmt header value for {key:?} must not be empty"
+        ));
+    }
+    Ok(())
+}
+
 fn detect_cpu_model() -> Option<String> {
     if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
-        for line in cpuinfo.lines() {
-            if let Some((lhs, rhs)) = line.split_once(':')
-                && lhs.trim() == "model name"
-            {
-                let trimmed = rhs.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_owned());
+        for key in ["model name", "Model", "Hardware", "uarch"] {
+            for line in cpuinfo.lines() {
+                if let Some((lhs, rhs)) = line.split_once(':')
+                    && lhs.trim() == key
+                {
+                    let trimmed = rhs.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_owned());
+                    }
                 }
             }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        && out.status.success()
+        && let Ok(raw) = String::from_utf8(out.stdout)
+    {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
         }
     }
     None
@@ -224,64 +311,141 @@ pub struct BenchRecord<'a> {
 impl BenchRecord<'_> {
     /// Writes this benchmark measurement line in Go `benchfmt` syntax.
     pub fn write(&self, mut out: impl Write) -> io::Result<()> {
-        let base = if self.name.starts_with("Benchmark") {
-            self.name.to_owned()
-        } else {
-            format!("Benchmark{}", self.name)
-        };
+        if !self.ns_per_op.is_finite() || self.ns_per_op < 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ns_per_op must be finite and >= 0, got {}", self.ns_per_op),
+            ));
+        }
+        if self.iterations > i64::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "iterations must be <= i64::MAX for Go benchfmt, got {}",
+                    self.iterations
+                ),
+            ));
+        }
+        let sanitized = sanitize_bench_name(self.name);
         let full_name = match self.cpu_procs {
-            Some(procs) if procs > 1 => format!("{base}-{procs}"),
-            _ => base,
+            Some(procs) if procs > 1 => format!("Benchmark{sanitized}-{procs}"),
+            _ => format!("Benchmark{sanitized}"),
         };
 
         write!(out, "{full_name}\t{:8}\t", self.iterations.max(1))?;
-        if self.ns_per_op >= 100.0 {
-            write!(out, "{:10.0} ns/op", self.ns_per_op)?;
-        } else if self.ns_per_op >= 10.0 {
-            write!(out, "{:10.2} ns/op", self.ns_per_op)?;
-        } else if self.ns_per_op >= 1.0 {
-            write!(out, "{:10.3} ns/op", self.ns_per_op)?;
+        // Match Go `testing/benchmark.go` `prettyPrint` widths and 4-significant-digit thresholds.
+        let y = self.ns_per_op;
+        if y == 0.0 || y >= 999.95 {
+            write!(out, "{y:10.0} ns/op")?;
+        } else if y >= 99.995 {
+            write!(out, "{y:12.1} ns/op")?;
+        } else if y >= 9.9995 {
+            write!(out, "{y:13.2} ns/op")?;
+        } else if y >= 0.99995 {
+            write!(out, "{y:14.3} ns/op")?;
+        } else if y >= 0.099995 {
+            write!(out, "{y:15.4} ns/op")?;
+        } else if y >= 0.0099995 {
+            write!(out, "{y:16.5} ns/op")?;
+        } else if y >= 0.00099995 {
+            write!(out, "{y:17.6} ns/op")?;
         } else {
-            write!(out, "{:10.4} ns/op", self.ns_per_op)?;
+            write!(out, "{y:18.7} ns/op")?;
         }
 
-        if let Some(mbps) = self.mb_per_sec {
-            write!(out, "\t{:8.2} MB/s", mbps)?;
+        if let Some(mbps) = self.mb_per_sec
+            && mbps.is_finite()
+            && mbps > 0.0
+        {
+            write!(out, "\t{mbps:8.2} MB/s")?;
         }
         if let Some(bytes) = self.alloc_bytes_per_op {
-            write!(out, "\t{:8} B/op", bytes)?;
+            write!(out, "\t{bytes:8} B/op")?;
         }
         if let Some(allocs) = self.allocs_per_op {
-            write!(out, "\t{:8} allocs/op", allocs)?;
+            write!(out, "\t{allocs:8} allocs/op")?;
         }
         writeln!(out)
     }
+}
+
+/// Strips leading `"Benchmark"` or `"benchmark"` prefixes when they act as Go's `Benchmark*`
+/// boundary (empty remainder or followed by a non-lowercase character), preserving words like
+/// `"Benchmarking"` while keeping [`sanitize_bench_name`] idempotent.
+fn strip_benchmark_prefix(mut s: &str) -> &str {
+    while let Some(rest) = s
+        .strip_prefix("Benchmark")
+        .or_else(|| s.strip_prefix("benchmark"))
+    {
+        if rest.chars().next().is_none_or(|ch| !ch.is_lowercase()) {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    s
 }
 
 /// Normalizes a Rust or Criterion benchmark identifier into a whitespace-free Go `Benchmark*`
 /// suffix while preserving `/key=value` sub-benchmark dimensions for `benchstat`.
 #[must_use]
 pub fn sanitize_bench_name(raw: &str) -> String {
-    let trimmed = raw.trim().trim_start_matches("Benchmark");
+    let trimmed = strip_benchmark_prefix(raw.trim());
     let mut out = String::with_capacity(trimmed.len() + 1);
     let mut chars = trimmed.chars();
     if let Some(first) = chars.next() {
-        out.extend(first.to_uppercase());
+        if first.is_whitespace() || first.is_control() {
+            out.push('_');
+        } else {
+            out.extend(first.to_uppercase());
+        }
     }
     for ch in chars {
-        match ch {
-            ' ' | '\t' => out.push('_'),
-            _ => out.push(ch),
+        if ch.is_whitespace() || ch.is_control() {
+            out.push('_');
+        } else {
+            out.push(ch);
         }
+    }
+    if out.is_empty() {
+        out.push('_');
     }
     out
 }
 
+const SUITE_USAGE: &str = "\
+Usage: <bench-binary> [OPTIONS] [FILTER]
+
+Go-compatible options:
+  -bench, -test.bench PATTERN             Run benchmarks matching PATTERN (`.` runs all).
+  -benchtime, -test.benchtime DURATION    Target duration (`2s`, `500ms`) or count (`1000x`).
+  -count, -test.count N                   Repeat each benchmark N epochs (default: 1).
+  -cpu, -test.cpu N                       Set `-N` CPU suffix on benchmark names.
+  -benchmem, -test.benchmem               Always report `B/op` and `allocs/op`.
+  -cpuprofile, -test.cpuprofile FILE      Write CPU pprof profile (`pprof` feature, Unix).
+  -memprofile, -test.memprofile FILE      Write heap pprof profile (`pprof` feature).
+  -memprofilerate, -test.memprofilerate N Mean bytes per heap sample (default: 524288).
+  -run, -test.run PATTERN                 Accepted for `go test` compatibility (ignored).
+
+Cargo / libtest options:
+  --pkg PKG                               Override `pkg:` metadata header line.
+  --list                                  List benchmarks without running them.
+  --exact                                 Require exact benchmark name match.
+  --skip PATTERN                          Skip benchmarks matching PATTERN.
+  --ignored                               Skip non-ignored benchmarks (libtest compatibility).
+  --test                                  Run 1 iteration per benchmark as a smoke test.
+  -h, --help                              Print this help text.
+";
+
 /// Runtime options parsed from CLI arguments for [`Suite`].
 #[derive(Clone, Debug)]
 pub struct BenchConfig {
-    /// Substring filter applied to benchmark names (`-bench` / `--filter`).
+    /// Substring (or `--exact`) filter applied to benchmark names (`-bench` / `--filter`).
     pub filter: Option<String>,
+    /// Patterns of benchmark names to skip (`--skip`).
+    pub skip: Vec<String>,
+    /// Require `filter` to match the full benchmark name rather than a substring (`--exact`).
+    pub exact: bool,
     /// Target duration or iteration count per epoch (`-benchtime`).
     pub benchtime: BenchTime,
     /// Number of independent epochs to execute (`-count`).
@@ -294,6 +458,13 @@ pub struct BenchConfig {
     pub pkg_override: Option<String>,
     /// List benchmark names without running them (`--list`).
     pub list_only: bool,
+    /// Run a single-iteration smoke test (`--test` compatibility executes one `1x` epoch per
+    /// benchmark).
+    pub test_mode: bool,
+    /// Skip all non-ignored benchmarks (`--ignored` `libtest` compatibility).
+    pub run_ignored_only: bool,
+    /// Print CLI usage text and exit without running benchmarks (`-h` / `--help`).
+    pub show_help: bool,
     /// Write a pprof CPU profile to this path (`-cpuprofile`).
     pub cpu_profile: Option<PathBuf>,
     /// Write a pprof heap allocation profile to this path (`-memprofile`).
@@ -310,12 +481,17 @@ impl Default for BenchConfig {
             .unwrap_or(1);
         Self {
             filter: None,
+            skip: Vec::new(),
+            exact: false,
             benchtime: BenchTime::default(),
             count: 1,
             cpu_procs,
             benchmem: false,
             pkg_override: None,
             list_only: false,
+            test_mode: false,
+            run_ignored_only: false,
+            show_help: false,
             cpu_profile: None,
             mem_profile: None,
             mem_profile_rate: DEFAULT_MEM_PROFILE_RATE,
@@ -336,25 +512,95 @@ impl BenchConfig {
         let mut iter = args.into_iter();
         while let Some(raw) = iter.next() {
             let arg = raw.as_ref();
-            if arg == "--bench" || arg == "-test.run" {
+            if matches!(arg, "-h" | "--help" | "-test.h") {
+                cfg.show_help = true;
+                continue;
+            }
+            if matches!(
+                arg,
+                "--bench"
+                    | "--nocapture"
+                    | "--no-capture"
+                    | "--show-output"
+                    | "--quiet"
+                    | "-q"
+                    | "--include-ignored"
+                    | "--report-time"
+                    | "--ensure-time"
+                    | "-v"
+                    | "-test.v"
+                    | "-test.paniconexit0"
+            ) || arg.starts_with("-test.v=")
+                || arg.starts_with("-test.paniconexit0=")
+            {
+                continue;
+            }
+            if arg == "--test" {
+                cfg.test_mode = true;
                 continue;
             }
             if arg == "--list" {
                 cfg.list_only = true;
                 continue;
             }
-            if arg == "-benchmem" || arg == "--benchmem" || arg == "-test.benchmem" {
+            if arg == "--exact" {
+                cfg.exact = true;
+                continue;
+            }
+            if arg == "--ignored" {
+                cfg.run_ignored_only = true;
+                continue;
+            }
+            if matches!(arg, "-benchmem" | "--benchmem" | "-test.benchmem") {
                 cfg.benchmem = true;
                 continue;
             }
+            if let Some(val) = arg
+                .strip_prefix("-benchmem=")
+                .or_else(|| arg.strip_prefix("--benchmem="))
+                .or_else(|| arg.strip_prefix("-test.benchmem="))
+            {
+                cfg.benchmem = match val {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => return Err(format!("invalid -benchmem value {val:?}")),
+                };
+                continue;
+            }
+            if split_flag(
+                arg,
+                &[
+                    "-run",
+                    "--run",
+                    "-test.run",
+                    "--color",
+                    "--format",
+                    "--test-threads",
+                    "--logfile",
+                    "-timeout",
+                    "-test.timeout",
+                    "-test.gocoverdir",
+                ],
+                &mut iter,
+            )?
+            .is_some()
+            {
+                continue;
+            }
+            if let Some(val) = split_flag(arg, &["--skip"], &mut iter)? {
+                if !val.is_empty() {
+                    cfg.skip.push(val);
+                }
+                continue;
+            }
             if let Some(val) = split_flag(arg, &["-bench", "--filter", "-test.bench"], &mut iter)? {
-                if val != "." && val != "^" {
-                    cfg.filter = Some(
-                        val.trim_start_matches('^')
-                            .trim_end_matches('$')
-                            .trim_start_matches("Benchmark")
-                            .to_owned(),
-                    );
+                if matches!(val.as_str(), "." | "^" | "$" | ".*" | "^.*$") {
+                    cfg.filter = None;
+                } else if val.is_empty() || val == "^$" {
+                    cfg.filter = Some("^$".to_owned());
+                } else {
+                    let unanchored = val.trim_start_matches('^').trim_end_matches('$');
+                    cfg.filter = Some(strip_benchmark_prefix(unanchored).to_owned());
                 }
                 continue;
             }
@@ -381,6 +627,7 @@ impl BenchConfig {
                 continue;
             }
             if let Some(val) = split_flag(arg, &["-pkg", "--pkg"], &mut iter)? {
+                validate_header_kv("pkg", &val)?;
                 cfg.pkg_override = Some(val);
                 continue;
             }
@@ -414,11 +661,36 @@ impl BenchConfig {
                     .map_err(|_| format!("invalid -memprofilerate {val:?}"))?;
                 continue;
             }
-            if !arg.starts_with('-') && cfg.filter.is_none() {
-                cfg.filter = Some(arg.trim_start_matches("Benchmark").to_owned());
+            if arg.starts_with('-') {
+                return Err(format!("unknown flag {arg:?}"));
             }
+            if cfg.filter.is_some() {
+                return Err(format!("unexpected extra positional argument {arg:?}"));
+            }
+            cfg.filter = Some(strip_benchmark_prefix(arg).to_owned());
         }
         Ok(cfg)
+    }
+}
+
+fn matches_bench_pattern(pattern: &str, exact: bool, raw_name: &str, sanitized_name: &str) -> bool {
+    if pattern == "^$" {
+        return false;
+    }
+    let full_name = format!("Benchmark{sanitized_name}");
+    let stripped = strip_benchmark_prefix(pattern);
+    if exact {
+        pattern == sanitized_name
+            || pattern == raw_name
+            || pattern == full_name
+            || stripped == sanitized_name
+            || stripped == raw_name
+    } else {
+        sanitized_name.contains(pattern)
+            || raw_name.contains(pattern)
+            || full_name.contains(pattern)
+            || (!stripped.is_empty()
+                && (sanitized_name.contains(stripped) || raw_name.contains(stripped)))
     }
 }
 
@@ -465,6 +737,8 @@ pub struct Bencher<'a> {
     target_n: u64,
     remaining: u64,
     started: bool,
+    fallback_start: Instant,
+    fallback_start_alloc: AllocSnapshot,
     start_instant: Option<Instant>,
     elapsed: Duration,
     bytes_per_op: Option<u64>,
@@ -485,11 +759,15 @@ impl<'a> Bencher<'a> {
         alloc_tracker: Option<&'a dyn AllocTracker>,
         profiler: Option<&'a mut dyn Profiler>,
     ) -> Self {
+        let fallback_start_alloc =
+            alloc_tracker.map_or_else(AllocSnapshot::default, |t| t.snapshot());
         Self {
             bench_name,
             target_n,
             remaining: target_n,
             started: false,
+            fallback_start: Instant::now(),
+            fallback_start_alloc,
             start_instant: None,
             elapsed: Duration::ZERO,
             bytes_per_op: None,
@@ -504,6 +782,9 @@ impl<'a> Bencher<'a> {
     }
 
     /// Returns the calibrated target iteration count (`b.N` in Go) for the current epoch.
+    ///
+    /// Prefer [`Bencher::keep_running`] or [`Bencher::iter`] so setup before the loop stays
+    /// excluded and scoped [`Profiler`] windows are bracketed automatically.
     #[must_use]
     pub const fn iterations(&self) -> u64 {
         self.target_n
@@ -519,26 +800,37 @@ impl<'a> Bencher<'a> {
         self.report_allocs = true;
     }
 
-    /// Resets the elapsed timer and allocation baseline, excluding any prior setup work.
+    /// Resets the elapsed timer and allocation baseline before the benchmark loop starts,
+    /// excluding any prior one-time setup work.
+    ///
+    /// Calling `reset_timer` inside an active [`Bencher::keep_running`] loop is unsupported
+    /// (matching Go 1.24's `b.Loop()`) and causes [`Suite::run_to`] to return
+    /// [`io::ErrorKind::InvalidInput`].
     pub fn reset_timer(&mut self) {
-        if self.profiler_running
-            && let Some(prof) = self.profiler.as_deref_mut()
-            && let Err(err) = prof
-                .stop_bench(self.bench_name)
-                .and_then(|()| prof.start_bench(self.bench_name))
-        {
-            self.profiler_running = false;
-            if self.profiler_err.is_none() {
-                self.profiler_err = Some(err);
+        if self.started {
+            if self.start_instant.is_some() {
+                // Abort the loop immediately so per-iteration `reset_timer()` calls never hang or
+                // mismeasure `target_n + 1` iterations.
+                self.remaining = 0;
+                if self.profiler_err.is_none() {
+                    self.profiler_err = Some(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "benchmark {:?} called reset_timer() inside keep_running(); move one-time setup before keep_running()",
+                            self.bench_name
+                        ),
+                    ));
+                }
             }
+            return;
         }
         if let Some(tracker) = self.alloc_tracker {
-            self.start_alloc = tracker.snapshot();
+            let snap = tracker.snapshot();
+            self.start_alloc = snap;
+            self.fallback_start_alloc = snap;
         }
         self.elapsed = Duration::ZERO;
-        if self.start_instant.is_some() {
-            self.start_instant = Some(Instant::now());
-        }
+        self.fallback_start = Instant::now();
     }
 
     /// Go 1.24 `b.Loop()` equivalent: starts timing and allocation tracking on the first call,
@@ -564,9 +856,9 @@ impl<'a> Bencher<'a> {
         if self.remaining == 0 {
             if let Some(started_at) = self.start_instant.take() {
                 self.elapsed += started_at.elapsed();
-            }
-            if let Some(tracker) = self.alloc_tracker {
-                self.alloc_delta = self.start_alloc.delta_to(tracker.snapshot());
+                if let Some(tracker) = self.alloc_tracker {
+                    self.alloc_delta = self.start_alloc.delta_to(tracker.snapshot());
+                }
             }
             // NOTE: Stop the profiler only after wall-clock and allocation deltas are recorded.
             if self.profiler_running {
@@ -593,7 +885,24 @@ impl<'a> Bencher<'a> {
     }
 }
 
+impl Drop for Bencher<'_> {
+    fn drop(&mut self) {
+        if self.profiler_running {
+            self.profiler_running = false;
+            if let Some(prof) = self.profiler.as_deref_mut() {
+                let _ = prof.stop_bench(self.bench_name);
+            }
+        }
+    }
+}
+
 type BenchFn<'a> = Box<dyn FnMut(&mut Bencher<'_>) + 'a>;
+
+struct RegisteredBench<'a> {
+    raw_name: String,
+    sanitized_name: String,
+    func: BenchFn<'a>,
+}
 
 /// Collection of benchmarks configured to emit Go `benchfmt` output.
 pub struct Suite<'a> {
@@ -601,7 +910,7 @@ pub struct Suite<'a> {
     config: BenchConfig,
     alloc_tracker: Option<&'a dyn AllocTracker>,
     profiler: Option<&'a mut dyn Profiler>,
-    benches: Vec<(String, BenchFn<'a>)>,
+    benches: Vec<RegisteredBench<'a>>,
 }
 
 impl<'a> Suite<'a> {
@@ -609,7 +918,7 @@ impl<'a> Suite<'a> {
     #[must_use]
     pub fn from_env(default_pkg: impl Into<String>) -> Self {
         let cfg = BenchConfig::from_args(std::env::args().skip(1)).unwrap_or_else(|err| {
-            eprintln!("benchfmt argument error: {err}");
+            eprintln!("benchfmt argument error: {err}\n\n{SUITE_USAGE}");
             std::process::exit(2);
         });
         Self::with_config(default_pkg, cfg)
@@ -631,8 +940,18 @@ impl<'a> Suite<'a> {
         }
     }
 
-    /// Attaches a global [`AllocTracker`] (such as [`CountingAlloc`]) so `B/op` and `allocs/op`
-    /// can be measured.
+    /// Replaces the [`BenchHeader`] emitted at the start of the suite output.
+    #[must_use]
+    pub fn with_header(mut self, mut header: BenchHeader) -> Self {
+        if let Some(pkg) = &self.config.pkg_override {
+            header.pkg.clone_from(pkg);
+        }
+        self.header = header;
+        self
+    }
+
+    /// Attaches a global [`AllocTracker`] (such as [`CountingAlloc`] or [`ProcessAlloc`]) so
+    /// `B/op` and `allocs/op` can be measured.
     #[must_use]
     pub fn with_alloc(mut self, tracker: &'a dyn AllocTracker) -> Self {
         self.alloc_tracker = Some(tracker);
@@ -656,8 +975,13 @@ impl<'a> Suite<'a> {
     /// Registers a benchmark function under `name`.
     #[must_use]
     pub fn bench(mut self, name: impl Into<String>, f: impl FnMut(&mut Bencher<'_>) + 'a) -> Self {
-        self.benches
-            .push((sanitize_bench_name(&name.into()), Box::new(f)));
+        let raw_name = name.into();
+        let sanitized_name = sanitize_bench_name(&raw_name);
+        self.benches.push(RegisteredBench {
+            raw_name,
+            sanitized_name,
+            func: Box::new(f),
+        });
         self
     }
 
@@ -673,9 +997,16 @@ impl<'a> Suite<'a> {
 
     /// Runs all matching benchmarks and writes `benchfmt` output to `out`.
     pub fn run_to(&mut self, mut out: impl Write) -> io::Result<()> {
+        if self.config.show_help {
+            write!(out, "{SUITE_USAGE}")?;
+            return out.flush();
+        }
         if self.config.list_only {
-            for (name, _) in &self.benches {
-                writeln!(out, "Benchmark{name}: benchmark")?;
+            for b in &self.benches {
+                if !self.should_run_bench(&b.raw_name, &b.sanitized_name) {
+                    continue;
+                }
+                writeln!(out, "Benchmark{}: benchmark", b.sanitized_name)?;
             }
             return Ok(());
         }
@@ -688,19 +1019,36 @@ impl<'a> Suite<'a> {
             ));
         }
 
+        self.header.validate()?;
+
         #[cfg(feature = "pprof")]
         let mut builtin_pprof = pprof_support::PprofSession::new(&self.config)?;
 
         self.header.write(&mut out)?;
         out.flush()?;
 
-        for (name, func) in &mut self.benches {
-            if let Some(filter) = &self.config.filter
-                && !name.contains(filter.as_str())
-            {
+        let effective_benchtime = if self.config.test_mode {
+            BenchTime::Iterations(1)
+        } else {
+            self.config.benchtime
+        };
+        let effective_count = if self.config.test_mode {
+            1
+        } else {
+            self.config.count.max(1)
+        };
+
+        for idx in 0..self.benches.len() {
+            if !self.should_run_bench(
+                &self.benches[idx].raw_name,
+                &self.benches[idx].sanitized_name,
+            ) {
                 continue;
             }
-            for _ in 0..self.config.count {
+            let bench = &mut self.benches[idx];
+            let name = &bench.sanitized_name;
+            let func = &mut bench.func;
+            for _ in 0..effective_count {
                 #[cfg(feature = "pprof")]
                 let rec = {
                     let has_any = builtin_pprof.is_some() || self.profiler.is_some();
@@ -715,7 +1063,7 @@ impl<'a> Suite<'a> {
                         if has_any { Some(&mut combined) } else { None };
                     run_single_epoch(
                         name,
-                        self.config.benchtime,
+                        effective_benchtime,
                         self.config.cpu_procs,
                         self.config.benchmem,
                         self.alloc_tracker,
@@ -726,7 +1074,7 @@ impl<'a> Suite<'a> {
                 #[cfg(not(feature = "pprof"))]
                 let rec = run_single_epoch(
                     name,
-                    self.config.benchtime,
+                    effective_benchtime,
                     self.config.cpu_procs,
                     self.config.benchmem,
                     self.alloc_tracker,
@@ -759,6 +1107,26 @@ impl<'a> Suite<'a> {
         writeln!(out, "PASS")?;
         out.flush()
     }
+
+    fn should_run_bench(&self, raw_name: &str, sanitized_name: &str) -> bool {
+        if self.config.run_ignored_only {
+            return false;
+        }
+        if let Some(filter) = &self.config.filter
+            && !matches_bench_pattern(filter, self.config.exact, raw_name, sanitized_name)
+        {
+            return false;
+        }
+        if self
+            .config
+            .skip
+            .iter()
+            .any(|pat| matches_bench_pattern(pat, false, raw_name, sanitized_name))
+        {
+            return false;
+        }
+        true
+    }
 }
 
 fn run_single_epoch<'a>(
@@ -771,7 +1139,7 @@ fn run_single_epoch<'a>(
     func: &mut BenchFn<'_>,
 ) -> io::Result<BenchRecord<'a>> {
     let mut n = match benchtime {
-        BenchTime::Iterations(fixed) => fixed,
+        BenchTime::Iterations(fixed) => fixed.max(1),
         BenchTime::Duration(_) => 1,
     };
 
@@ -785,11 +1153,18 @@ fn run_single_epoch<'a>(
                 profiler.as_mut().map(|p| &mut **p as &mut dyn Profiler),
             );
             func(&mut bencher);
-            // Finalize timing if the benchmark body exited early without exhausting `keep_running`.
+            // Finalize timing if the benchmark body exited without exhausting `keep_running`.
             if let Some(started_at) = bencher.start_instant.take() {
                 bencher.elapsed += started_at.elapsed();
                 if let Some(tracker) = bencher.alloc_tracker {
                     bencher.alloc_delta = bencher.start_alloc.delta_to(tracker.snapshot());
+                }
+            } else if !bencher.started {
+                // Support legacy `for _ in 0..b.iterations()` closures that do not call
+                // `keep_running()`.
+                bencher.elapsed = bencher.fallback_start.elapsed();
+                if let Some(tracker) = bencher.alloc_tracker {
+                    bencher.alloc_delta = bencher.fallback_start_alloc.delta_to(tracker.snapshot());
                 }
             }
             if bencher.profiler_running {
@@ -801,8 +1176,17 @@ fn run_single_epoch<'a>(
                     bencher.profiler_err = Some(err);
                 }
             }
-            if let Some(err) = bencher.profiler_err {
+            if let Some(err) = bencher.profiler_err.take() {
                 return Err(err);
+            }
+            if bencher.started && bencher.remaining != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "benchmark {name:?} exited keep_running() early with {} of {n} iterations remaining",
+                        bencher.remaining
+                    ),
+                ));
             }
             (
                 bencher.elapsed,
@@ -852,7 +1236,7 @@ fn run_single_epoch<'a>(
             .saturating_mul(u128::from(n))
             .checked_div(elapsed_ns)
         {
-            let predicted = predicted as u64;
+            let predicted = u64::try_from(predicted).unwrap_or(u64::MAX);
             // Grow by 20% above the linear prediction, capped at 100x per step, matching Go.
             let padded = predicted.saturating_add(predicted / 5);
             padded.min(n.saturating_mul(100)).max(n + 1)
@@ -946,7 +1330,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.contains(
-                "BenchmarkParsePromText/parser=rust-2\t      30\t       100 ns/op\t10000.00 MB/s"
+                "BenchmarkParsePromText/parser=rust-2\t      30\t       100.0 ns/op\t10000.00 MB/s"
             ),
             "{text}"
         );
@@ -983,6 +1367,513 @@ mod tests {
             Some(std::path::Path::new("mem.pb.gz"))
         );
         assert_eq!(cfg.mem_profile_rate, 4096);
+    }
+
+    #[test]
+    fn parses_benchtime_units_and_rejects_invalid_values() {
+        assert_eq!(
+            BenchTime::parse("250ns").unwrap(),
+            BenchTime::Duration(Duration::from_nanos(250))
+        );
+        assert_eq!(
+            BenchTime::parse("100us").unwrap(),
+            BenchTime::Duration(Duration::from_micros(100))
+        );
+        assert_eq!(
+            BenchTime::parse("100µs").unwrap(),
+            BenchTime::Duration(Duration::from_micros(100))
+        );
+        assert_eq!(
+            BenchTime::parse("50ms").unwrap(),
+            BenchTime::Duration(Duration::from_millis(50))
+        );
+        assert_eq!(
+            BenchTime::parse("2s").unwrap(),
+            BenchTime::Duration(Duration::from_secs(2))
+        );
+        assert_eq!(
+            BenchTime::parse("0.5m").unwrap(),
+            BenchTime::Duration(Duration::from_secs(30))
+        );
+        assert_eq!(
+            BenchTime::parse("1000x").unwrap(),
+            BenchTime::Iterations(1_000)
+        );
+
+        for bad in [
+            "0x", "0s", "0ns", "-1s", "-5ms", "NaNs", "infs", "1e300s", "10h", "",
+        ] {
+            assert!(
+                BenchTime::parse(bad).is_err(),
+                "expected error for invalid benchtime {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_go_and_cargo_cli_flags_cleanly() {
+        // `-test.run` / `-run` consume their pattern and `-bench .` clears any earlier filter.
+        let cfg = BenchConfig::from_args([
+            "-run",
+            "^$",
+            "-test.run",
+            "TestNothing",
+            "-bench",
+            "^BenchmarkDecode$",
+            "-bench",
+            ".",
+            "--color",
+            "never",
+            "--format=terse",
+            "--nocapture",
+            "--exact",
+            "--skip",
+            "Slow",
+        ])
+        .unwrap();
+        assert_eq!(cfg.filter, None);
+        assert!(cfg.exact);
+        assert_eq!(cfg.skip, vec!["Slow"]);
+
+        // Boolean `libtest` flags (`--report-time`, `--ensure-time`, `--no-capture`) do not
+        // swallow a trailing positional filter, and Go `-test.benchmem=true/false` is supported.
+        let libtest_bool = BenchConfig::from_args([
+            "--report-time",
+            "--ensure-time",
+            "--no-capture",
+            "-test.benchmem=true",
+            "Decode",
+        ])
+        .unwrap();
+        assert_eq!(libtest_bool.filter.as_deref(), Some("Decode"));
+        assert!(libtest_bool.benchmem);
+        assert!(
+            !BenchConfig::from_args(["-benchmem=false"])
+                .unwrap()
+                .benchmem
+        );
+        assert!(BenchConfig::from_args(["-test.benchmem=maybe"]).is_err());
+
+        // `-bench '^$'` matches nothing rather than everything.
+        let empty_pat = BenchConfig::from_args(["-bench", "^$"]).unwrap();
+        assert_eq!(empty_pat.filter.as_deref(), Some("^$"));
+
+        // Unknown flags, invalid `--pkg`, and extra positional args fail fast.
+        assert!(BenchConfig::from_args(["-benchtimee", "2s"]).is_err());
+        assert!(BenchConfig::from_args(["--pkg", ""]).is_err());
+        assert!(BenchConfig::from_args(["--pkg", "bad\npkg"]).is_err());
+        assert!(BenchConfig::from_args(["FilterOne", "FilterTwo"]).is_err());
+    }
+
+    #[test]
+    fn sanitizes_names_and_validates_headers_and_precision_tiers() {
+        assert_eq!(sanitize_bench_name("Benchmarking/sub"), "Benchmarking/sub");
+        assert_eq!(sanitize_bench_name("benchmarking/sub"), "Benchmarking/sub");
+        assert_eq!(sanitize_bench_name("Benchmarks"), "Benchmarks");
+        assert_eq!(sanitize_bench_name("BenchmarkBenchmarkFoo"), "Foo");
+        assert_eq!(sanitize_bench_name("benchmark_decode"), "_decode");
+        for sample in [
+            "Benchmarking/sub",
+            "benchmarking/sub",
+            "BenchmarkBenchmarkFoo",
+            "benchmark_decode",
+            "Benchmark",
+            "benchmark",
+        ] {
+            let once = sanitize_bench_name(sample);
+            assert_eq!(sanitize_bench_name(&once), once, "non-idempotent: {sample}");
+        }
+        assert_eq!(sanitize_bench_name("decode\tline\ninj"), "Decode_line_inj");
+        assert_eq!(sanitize_bench_name("   "), "_");
+        assert_eq!(sanitize_bench_name("Benchmark"), "_");
+
+        // Header validation rejects uppercase keys, colons, spaces, and newline values.
+        for (k, v) in [
+            ("IMPL", "rust"),
+            ("bad key", "v"),
+            ("bad:key", "v"),
+            ("", "v"),
+            ("impl", ""),
+            ("impl", "line1\nline2"),
+        ] {
+            let hdr = BenchHeader {
+                goos: "linux".to_owned(),
+                goarch: "amd64".to_owned(),
+                pkg: "pkg".to_owned(),
+                cpu: None,
+                extra: vec![(k.to_owned(), v.to_owned())],
+            };
+            assert!(
+                hdr.write(Vec::new()).is_err(),
+                "expected invalid header for ({k:?}, {v:?})"
+            );
+        }
+
+        // Go `prettyPrint` 4-sig-fig formatting across magnitudes.
+        let cases = [
+            (1250.4, "      1250 ns/op"),
+            (100.4, "       100.4 ns/op"),
+            (12.346, "        12.35 ns/op"),
+            (1.2346, "         1.235 ns/op"),
+            (0.12346, "         0.1235 ns/op"),
+            (0.0012346, "         0.001235 ns/op"),
+        ];
+        for (ns_per_op, expected) in cases {
+            let mut buf = Vec::new();
+            BenchRecord {
+                name: "Fmt",
+                cpu_procs: Some(1),
+                iterations: 10,
+                ns_per_op,
+                mb_per_sec: None,
+                alloc_bytes_per_op: None,
+                allocs_per_op: None,
+            }
+            .write(&mut buf)
+            .unwrap();
+            let line = String::from_utf8(buf).unwrap();
+            assert!(
+                line.contains(expected),
+                "got {line:?}, expected {expected:?}"
+            );
+        }
+
+        assert!(
+            BenchRecord {
+                name: "Bad",
+                cpu_procs: None,
+                iterations: 1,
+                ns_per_op: f64::NAN,
+                mb_per_sec: None,
+                alloc_bytes_per_op: None,
+                allocs_per_op: None,
+            }
+            .write(Vec::new())
+            .is_err()
+        );
+        assert!(
+            BenchRecord {
+                name: "OverflowIters",
+                cpu_procs: None,
+                iterations: (i64::MAX as u64) + 1,
+                ns_per_op: 1.0,
+                mb_per_sec: None,
+                alloc_bytes_per_op: None,
+                allocs_per_op: None,
+            }
+            .write(Vec::new())
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn suite_duration_calibration_reset_timer_and_bencher_contracts() {
+        // Duration calibration + lowercase filter matching + `reset_timer` + `with_tag`.
+        let cfg = BenchConfig {
+            filter: Some("decode".to_owned()),
+            skip: vec!["ignored_case".to_owned()],
+            benchtime: BenchTime::Duration(Duration::from_millis(5)),
+            count: 1,
+            cpu_procs: 1,
+            benchmem: true,
+            ..BenchConfig::default()
+        };
+        let mut out = Vec::new();
+        Suite::with_config("pkg", cfg)
+            .with_alloc(&TEST_ALLOC)
+            .with_tag("impl", "rust")
+            .bench("decode/case=fast", |b| {
+                let _setup = vec![1u8; 4096];
+                b.reset_timer();
+                while b.keep_running() {
+                    black_box(vec![2u8; 128]);
+                }
+                // Extra post-loop `keep_running()` and `reset_timer()` calls must not overwrite
+                // `elapsed` or `alloc_delta`.
+                let _after = vec![3u8; 8192];
+                assert!(!b.keep_running());
+                b.reset_timer();
+                black_box(_after);
+            })
+            .bench("decode/case=ignored_case", |b| b.iter(|| 1))
+            .run_to(&mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("impl: rust\n"), "{text}");
+        assert!(text.contains("BenchmarkDecode/case=fast\t"), "{text}");
+        assert!(text.contains("     128 B/op\t       1 allocs/op"), "{text}");
+        assert!(!text.contains("ignored_case"), "{text}");
+
+        // Legacy `for _ in 0..b.iterations()` loop and `Iterations(0)` clamping.
+        let mut legacy_out = Vec::new();
+        Suite::with_config(
+            "pkg",
+            BenchConfig {
+                benchtime: BenchTime::Iterations(0),
+                benchmem: true,
+                cpu_procs: 1,
+                ..BenchConfig::default()
+            },
+        )
+        .with_alloc(&TEST_ALLOC)
+        .bench("LegacyLoop", |b| {
+            b.reset_timer();
+            for _ in 0..b.iterations() {
+                black_box(vec![5u8; 64]);
+            }
+        })
+        .run_to(&mut legacy_out)
+        .unwrap();
+        let legacy_text = String::from_utf8(legacy_out).unwrap();
+        assert!(
+            legacy_text.contains("      64 B/op\t       1 allocs/op"),
+            "{legacy_text}"
+        );
+
+        // Early `break` inside `keep_running()` returns an InvalidInput error.
+        let err = Suite::with_config(
+            "pkg",
+            BenchConfig {
+                benchtime: BenchTime::Iterations(10),
+                ..BenchConfig::default()
+            },
+        )
+        .bench("EarlyBreak", |b| {
+            let mut step = 0;
+            while b.keep_running() {
+                step += 1;
+                if step == 2 {
+                    break;
+                }
+            }
+        })
+        .run_to(Vec::new())
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Calling `reset_timer()` inside `keep_running()` aborts immediately with `InvalidInput`
+        // rather than hanging or running `N + 1` iterations.
+        let mut in_loop_iters = 0usize;
+        let reset_err = Suite::with_config(
+            "pkg",
+            BenchConfig {
+                benchtime: BenchTime::Iterations(10),
+                ..BenchConfig::default()
+            },
+        )
+        .bench("ResetInLoop", |b| {
+            while b.keep_running() {
+                in_loop_iters += 1;
+                b.reset_timer();
+            }
+        })
+        .run_to(Vec::new())
+        .unwrap_err();
+        assert_eq!(reset_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(in_loop_iters, 1);
+
+        // `--list`, `--help`, `--test`, `--ignored`, `--exact`, `-bench '^$'`, and `with_header`.
+        let mut list_out = Vec::new();
+        Suite::with_config(
+            "pkg",
+            BenchConfig {
+                filter: Some("Alpha".to_owned()),
+                exact: true,
+                list_only: true,
+                ..BenchConfig::default()
+            },
+        )
+        .bench("Alpha", |b| b.iter(|| 1))
+        .bench("AlphaExtra", |b| b.iter(|| 1))
+        .run_to(&mut list_out)
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(list_out).unwrap(),
+            "BenchmarkAlpha: benchmark\n"
+        );
+
+        let mut help_out = Vec::new();
+        Suite::with_config(
+            "pkg",
+            BenchConfig {
+                show_help: true,
+                ..BenchConfig::default()
+            },
+        )
+        .bench("Alpha", |b| b.iter(|| 1))
+        .run_to(&mut help_out)
+        .unwrap();
+        assert!(String::from_utf8(help_out).unwrap().contains("-benchtime"));
+
+        let mut smoke_runs = 0usize;
+        let mut smoke_out = Vec::new();
+        Suite::with_config(
+            "default_pkg",
+            BenchConfig {
+                test_mode: true,
+                benchtime: BenchTime::Iterations(100),
+                count: 5,
+                pkg_override: Some("override_pkg".to_owned()),
+                ..BenchConfig::default()
+            },
+        )
+        .with_header(BenchHeader {
+            goos: "linux".to_owned(),
+            goarch: "amd64".to_owned(),
+            pkg: "header_pkg".to_owned(),
+            cpu: None,
+            extra: Vec::new(),
+        })
+        .bench("Smoke", |b| {
+            while b.keep_running() {
+                smoke_runs += 1;
+            }
+        })
+        .run_to(&mut smoke_out)
+        .unwrap();
+        assert_eq!(smoke_runs, 1);
+        let smoke_text = String::from_utf8(smoke_out).unwrap();
+        assert!(smoke_text.contains("pkg: override_pkg\n"), "{smoke_text}");
+        assert!(smoke_text.contains("BenchmarkSmoke"), "{smoke_text}");
+
+        for cfg in [
+            BenchConfig {
+                run_ignored_only: true,
+                ..BenchConfig::default()
+            },
+            BenchConfig {
+                filter: Some("^$".to_owned()),
+                ..BenchConfig::default()
+            },
+        ] {
+            let mut empty_out = Vec::new();
+            Suite::with_config("pkg", cfg)
+                .bench("Alpha", |b| b.iter(|| 1))
+                .run_to(&mut empty_out)
+                .unwrap();
+            let empty_text = String::from_utf8(empty_out).unwrap();
+            assert!(!empty_text.contains("BenchmarkAlpha"), "{empty_text}");
+            assert!(empty_text.ends_with("PASS\n"), "{empty_text}");
+        }
+    }
+
+    #[test]
+    fn counting_alloc_isolates_threads_and_handles_zeroed_and_shrink() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // NOTE: Synchronize with `AtomicBool` rather than `std::sync::Barrier` between snapshots
+        // because `Barrier::wait` lazily heap-allocates `pthread_mutex_t` and `pthread_cond_t` on
+        // first use on macOS.
+        let start = std::sync::Arc::new(AtomicBool::new(false));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let start_bg = std::sync::Arc::clone(&start);
+        let done_bg = std::sync::Arc::clone(&done);
+        let handle = thread::spawn(move || {
+            while !start_bg.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            for _ in 0..100 {
+                black_box(vec![9u8; 4096]);
+            }
+            done_bg.store(true, Ordering::Release);
+        });
+        let before = TEST_ALLOC.snapshot();
+        start.store(true, Ordering::Release);
+        while !done.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        assert_eq!(
+            before.delta_to(TEST_ALLOC.snapshot()),
+            AllocSnapshot::default()
+        );
+        handle.join().unwrap();
+
+        // `vec![0u8; 512]` exercises `alloc_zeroed`, and `reserve_exact` exercises `realloc`
+        // growth deterministically even when the system allocator extends in-place.
+        let mut out = Vec::new();
+        Suite::with_config(
+            "pkg",
+            BenchConfig {
+                benchtime: BenchTime::Iterations(20),
+                cpu_procs: 1,
+                benchmem: true,
+                ..BenchConfig::default()
+            },
+        )
+        .with_alloc(&TEST_ALLOC)
+        .bench("ZeroedAndReallocGrow", |b| {
+            while b.keep_running() {
+                black_box(vec![0u8; 512]);
+                let mut v = Vec::<u8>::with_capacity(64);
+                v.reserve_exact(192);
+                black_box(v);
+            }
+        })
+        .run_to(&mut out)
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("     768 B/op\t       3 allocs/op"), "{text}");
+
+        // Wrapping delta behavior.
+        let wrapped = AllocSnapshot {
+            allocs: u64::MAX,
+            bytes: u64::MAX - 9,
+        }
+        .delta_to(AllocSnapshot {
+            allocs: 2,
+            bytes: 10,
+        });
+        assert_eq!(
+            wrapped,
+            AllocSnapshot {
+                allocs: 3,
+                bytes: 20
+            }
+        );
+    }
+
+    #[test]
+    fn bencher_drop_stops_active_profiler_on_panic() {
+        #[derive(Default)]
+        struct PanicProfiler {
+            stopped: bool,
+        }
+        impl Profiler for PanicProfiler {
+            fn start_bench(&mut self, _bench_name: &str) -> io::Result<()> {
+                Ok(())
+            }
+            fn stop_bench(&mut self, _bench_name: &str) -> io::Result<()> {
+                self.stopped = true;
+                Ok(())
+            }
+        }
+
+        let mut prof = PanicProfiler::default();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = Suite::with_config(
+                "pkg",
+                BenchConfig {
+                    benchtime: BenchTime::Iterations(5),
+                    ..BenchConfig::default()
+                },
+            )
+            .with_profiler(&mut prof)
+            .bench("Boom", |b| {
+                let mut step = 0;
+                while b.keep_running() {
+                    step += 1;
+                    if step == 2 {
+                        panic!("simulated benchmark panic");
+                    }
+                }
+            })
+            .run_to(Vec::new());
+        }));
+        assert!(res.is_err());
+        assert!(
+            prof.stopped,
+            "expected Bencher::drop to stop active profiler"
+        );
     }
 
     #[test]
@@ -1064,193 +1955,5 @@ mod tests {
             .run_to(&mut out)
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-    }
-
-    #[cfg(feature = "pprof")]
-    #[inline(never)]
-    fn unmeasured_setup_alloc_helper(size: usize) -> Vec<u8> {
-        vec![9u8; size]
-    }
-
-    #[cfg(feature = "pprof")]
-    #[inline(never)]
-    fn tracked_heap_alloc_helper(size: usize) -> Vec<u8> {
-        vec![42u8; size]
-    }
-
-    #[cfg(feature = "pprof")]
-    #[inline(never)]
-    fn cpu_burn_helper(rounds: u64) -> u64 {
-        let mut acc = 1u64;
-        for i in 0..rounds {
-            acc = acc.wrapping_mul(6364136223846793005).wrapping_add(i | 1);
-            black_box(acc);
-        }
-        acc
-    }
-
-    #[cfg(feature = "pprof")]
-    #[test]
-    fn writes_scoped_mem_and_cpu_pprof_profiles() {
-        use std::io::Read;
-
-        let dir = std::env::temp_dir().join(format!("benchfmt_pprof_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let mem_path = dir.join("mem.pb.gz");
-        let cpu_path = dir.join("cpu.pb.gz");
-
-        let cfg = BenchConfig {
-            benchtime: BenchTime::Iterations(40),
-            count: 1,
-            cpu_procs: 1,
-            benchmem: true,
-            #[cfg(unix)]
-            cpu_profile: Some(cpu_path.clone()),
-            mem_profile: Some(mem_path.clone()),
-            // Sample every allocation so deterministic assertions hold on small iteration counts.
-            mem_profile_rate: 1,
-            ..BenchConfig::default()
-        };
-
-        let mut out = Vec::new();
-        Suite::with_config("pprof_test", cfg)
-            .with_alloc(&TEST_ALLOC)
-            .bench("BurnAndAlloc", |b| {
-                // Unmeasured setup allocation must not appear in `B/op` or `mem.pb.gz`.
-                let unmeasured_setup = unmeasured_setup_alloc_helper(65_536);
-                black_box(&unmeasured_setup);
-                while b.keep_running() {
-                    black_box(tracked_heap_alloc_helper(2048));
-                    black_box(cpu_burn_helper(250_000));
-                }
-            })
-            .run_to(&mut out)
-            .unwrap();
-
-        let text = String::from_utf8(out).unwrap();
-        assert!(
-            text.contains("    2048 B/op\t       1 allocs/op"),
-            "profiler internal allocations leaked into benchfmt output:\n{text}"
-        );
-
-        let mem_gz = fs::read(&mem_path).unwrap();
-        assert_eq!(&mem_gz[..2], &[0x1f, 0x8b], "expected gzip magic header");
-        let mut mem_raw = Vec::new();
-        flate2::read::GzDecoder::new(&mem_gz[..])
-            .read_to_end(&mut mem_raw)
-            .unwrap();
-        let mem_lossy = String::from_utf8_lossy(&mem_raw);
-        assert!(mem_lossy.contains("alloc_space"), "{mem_lossy}");
-        assert!(
-            mem_lossy.contains("tracked_heap_alloc_helper"),
-            "expected symbolicated helper in memprofile"
-        );
-        assert!(
-            !mem_lossy.contains("unmeasured_setup_alloc_helper"),
-            "setup allocations outside keep_running leaked into memprofile"
-        );
-
-        #[cfg(unix)]
-        {
-            let cpu_gz = fs::read(&cpu_path).unwrap();
-            assert_eq!(&cpu_gz[..2], &[0x1f, 0x8b], "expected gzip magic header");
-            let mut cpu_raw = Vec::new();
-            flate2::read::GzDecoder::new(&cpu_gz[..])
-                .read_to_end(&mut cpu_raw)
-                .unwrap();
-            let cpu_lossy = String::from_utf8_lossy(&cpu_raw);
-            assert!(cpu_lossy.contains("nanoseconds"), "{cpu_lossy}");
-            assert!(
-                cpu_lossy.contains("cpu_burn_helper"),
-                "expected symbolicated helper in cpuprofile"
-            );
-        }
-
-        if let Ok(go_ver) = std::process::Command::new("go").arg("version").output()
-            && go_ver.status.success()
-        {
-            let mem_top = std::process::Command::new("go")
-                .args(["tool", "pprof", "-top", mem_path.to_str().unwrap()])
-                .output()
-                .unwrap();
-            let mem_stdout = String::from_utf8_lossy(&mem_top.stdout);
-            let mem_stderr = String::from_utf8_lossy(&mem_top.stderr);
-            assert!(
-                mem_top.status.success(),
-                "go tool pprof failed on memprofile:\nstdout:\n{mem_stdout}\nstderr:\n{mem_stderr}"
-            );
-            assert!(
-                mem_stdout.contains("tracked_heap_alloc_helper"),
-                "go tool pprof -top missing tracked_heap_alloc_helper:\n{mem_stdout}"
-            );
-
-            #[cfg(unix)]
-            {
-                let cpu_top = std::process::Command::new("go")
-                    .args(["tool", "pprof", "-top", cpu_path.to_str().unwrap()])
-                    .output()
-                    .unwrap();
-                let cpu_stdout = String::from_utf8_lossy(&cpu_top.stdout);
-                let cpu_stderr = String::from_utf8_lossy(&cpu_top.stderr);
-                assert!(
-                    cpu_top.status.success(),
-                    "go tool pprof failed on cpuprofile:\nstdout:\n{cpu_stdout}\nstderr:\n{cpu_stderr}"
-                );
-                assert!(
-                    cpu_stdout.contains("cpu_burn_helper"),
-                    "go tool pprof -top missing cpu_burn_helper:\n{cpu_stdout}"
-                );
-            }
-        }
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(feature = "pprof")]
-    #[test]
-    fn poisson_memprofile_sampling_scales_allocations() {
-        use std::io::Read;
-
-        let dir =
-            std::env::temp_dir().join(format!("benchfmt_pprof_poisson_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let mem_path = dir.join("poisson_mem.pb.gz");
-
-        let cfg = BenchConfig {
-            benchtime: BenchTime::Iterations(1_000),
-            count: 1,
-            cpu_procs: 1,
-            benchmem: true,
-            mem_profile: Some(mem_path.clone()),
-            mem_profile_rate: 16 * 1024,
-            ..BenchConfig::default()
-        };
-
-        let mut out = Vec::new();
-        Suite::with_config("pprof_poisson", cfg)
-            .with_alloc(&TEST_ALLOC)
-            .bench("PoissonAlloc", |b| {
-                while b.keep_running() {
-                    black_box(tracked_heap_alloc_helper(1024));
-                }
-            })
-            .run_to(&mut out)
-            .unwrap();
-
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("    1024 B/op\t       1 allocs/op"), "{text}");
-
-        let mem_gz = fs::read(&mem_path).unwrap();
-        let mut mem_raw = Vec::new();
-        flate2::read::GzDecoder::new(&mem_gz[..])
-            .read_to_end(&mut mem_raw)
-            .unwrap();
-        assert!(
-            String::from_utf8_lossy(&mem_raw).contains("tracked_heap_alloc_helper"),
-            "expected sampled stack in Poisson memprofile"
-        );
-        let _ = fs::remove_dir_all(&dir);
     }
 }

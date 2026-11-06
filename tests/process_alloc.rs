@@ -181,9 +181,17 @@ fn process_alloc_counts_worker_thread_allocations_across_suite() {
         flate2::read::GzDecoder::new(&mem_gz[..])
             .read_to_end(&mut mem_raw)
             .unwrap();
+        let mem_lossy = String::from_utf8_lossy(&mem_raw);
         assert!(
-            String::from_utf8_lossy(&mem_raw).contains("worker_heap_alloc_helper"),
+            mem_lossy.contains("worker_heap_alloc_helper"),
             "expected worker-thread allocation helper in memprofile"
+        );
+        assert!(
+            !mem_lossy.contains("ProcessAlloc")
+                && !mem_lossy.contains("record_alloc")
+                && !mem_lossy.contains("capture_heap_sample")
+                && !mem_lossy.contains("alloc_impl"),
+            "internal ProcessAlloc or allocator frames leaked into memprofile"
         );
         let _ = fs::remove_dir_all(&dir);
     }

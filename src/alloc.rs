@@ -38,12 +38,12 @@ fn record_thread_alloc(bytes: usize) {
     crate::pprof_support::maybe_record_heap_alloc(bytes);
 }
 
-/// Point-in-time snapshot of cumulative heap allocations on the current thread.
+/// Point-in-time snapshot of cumulative heap allocation counters from an [`AllocTracker`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllocSnapshot {
-    /// Total number of heap allocation calls observed so far on the calling thread.
+    /// Total number of heap allocation calls observed so far by the tracker.
     pub allocs: u64,
-    /// Total number of heap bytes requested so far on the calling thread.
+    /// Total number of heap bytes requested so far by the tracker.
     pub bytes: u64,
 }
 
@@ -60,7 +60,8 @@ impl AllocSnapshot {
 
 /// Trait implemented by allocation trackers attached to a [`crate::Suite`].
 pub trait AllocTracker: Sync {
-    /// Captures the current cumulative allocation counters for the calling thread.
+    /// Captures the tracker's current cumulative allocation counters (thread-local for
+    /// [`CountingAlloc`], process-wide for [`ProcessAlloc`]).
     fn snapshot(&self) -> AllocSnapshot;
 }
 
@@ -139,9 +140,12 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAlloc<A> {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let old_addr = ptr.addr();
         // SAFETY: Upheld by the caller of `GlobalAlloc::realloc`.
         let new_ptr = unsafe { self.inner.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
+        // NOTE: Always record growth deterministically to match Go's slice append behavior, while
+        // ignoring in-place shrinks (`shrink_to_fit` / `into_boxed_slice`) that reuse `ptr`.
+        if !new_ptr.is_null() && (new_size > layout.size() || new_ptr.addr() != old_addr) {
             record_thread_alloc(new_size);
         }
         new_ptr
@@ -252,5 +256,99 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for ProcessAlloc<A> {
             self.record_alloc(new_size);
         }
         new_ptr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubRealloc {
+        relocate_on_shrink: bool,
+        fail: bool,
+    }
+
+    unsafe impl GlobalAlloc for StubRealloc {
+        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+            if self.fail {
+                std::ptr::null_mut()
+            } else {
+                std::ptr::without_provenance_mut(0x1000)
+            }
+        }
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            unsafe { self.alloc(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if self.fail {
+                return std::ptr::null_mut();
+            }
+            if new_size < layout.size() && self.relocate_on_shrink {
+                std::ptr::without_provenance_mut(ptr.addr() + 0x1000)
+            } else {
+                ptr
+            }
+        }
+    }
+
+    fn assert_tracker_realloc_and_zeroed<T: GlobalAlloc + AllocTracker>(
+        make: impl Fn(StubRealloc) -> T,
+    ) {
+        let in_place = make(StubRealloc {
+            relocate_on_shrink: false,
+            fail: false,
+        });
+        let layout = Layout::from_size_align(128, 8).unwrap();
+        let s0 = AllocTracker::snapshot(&in_place);
+        let ptr = unsafe { in_place.alloc(layout) };
+        let _ = unsafe { in_place.alloc_zeroed(layout) };
+        // In-place growth (`new_size > layout.size()`) must be counted even when `new_ptr == ptr`.
+        let ptr = unsafe { in_place.realloc(ptr, layout, 256) };
+        let grown_layout = Layout::from_size_align(256, 8).unwrap();
+        // Same-size and in-place shrink (`new_size <= layout.size()` and `new_ptr == ptr`) must be
+        // ignored.
+        let ptr = unsafe { in_place.realloc(ptr, grown_layout, 256) };
+        let _ = unsafe { in_place.realloc(ptr, grown_layout, 64) };
+        assert_eq!(
+            s0.delta_to(AllocTracker::snapshot(&in_place)),
+            AllocSnapshot {
+                allocs: 3,
+                bytes: 128 + 128 + 256,
+            }
+        );
+
+        let relocating = make(StubRealloc {
+            relocate_on_shrink: true,
+            fail: false,
+        });
+        let s1 = AllocTracker::snapshot(&relocating);
+        let _ = unsafe { relocating.realloc(ptr, grown_layout, 64) };
+        assert_eq!(
+            s1.delta_to(AllocTracker::snapshot(&relocating)),
+            AllocSnapshot {
+                allocs: 1,
+                bytes: 64,
+            }
+        );
+
+        let failing = make(StubRealloc {
+            relocate_on_shrink: false,
+            fail: true,
+        });
+        let s2 = AllocTracker::snapshot(&failing);
+        assert!(unsafe { failing.alloc(layout) }.is_null());
+        assert!(unsafe { failing.alloc_zeroed(layout) }.is_null());
+        assert!(unsafe { failing.realloc(ptr, grown_layout, 512) }.is_null());
+        assert_eq!(
+            s2.delta_to(AllocTracker::snapshot(&failing)),
+            AllocSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn realloc_counts_growth_and_relocating_shrink_but_ignores_in_place_shrink() {
+        assert_tracker_realloc_and_zeroed(CountingAlloc::with_allocator);
+        assert_tracker_realloc_and_zeroed(ProcessAlloc::with_allocator);
     }
 }

@@ -120,14 +120,14 @@ go tool pprof -http=:8080 cpu.pb.gz
 go tool pprof -http=:8080 mem.pb.gz
 ```
 
-`-memprofilerate` controls the mean bytes allocated per heap sample, defaulting to `524288` for 512 KiB just like Go's `runtime.MemProfileRate`. Passing `-memprofilerate 1` records every heap allocation. Custom profilers can also hook into [`Suite::with_profiler`](https://github.com/bwplotka/benchfmt.rs/blob/main/src/lib.rs#L644-L647) via the zero-dependency [`Profiler`](https://github.com/bwplotka/benchfmt.rs/blob/main/src/lib.rs#L449-L460) trait.
+`-memprofilerate` controls the mean bytes allocated per heap sample, defaulting to `524288` for 512 KiB just like Go's `runtime.MemProfileRate`. Passing `-memprofilerate 1` records every heap allocation. Custom profilers can also hook into [`Suite::with_profiler`](src/lib.rs) via the zero-dependency [`Profiler`](src/lib.rs) trait.
 
 ##### Scope compared to Go's `testing.B`
 
-- `-bench` strips leading `^`, trailing `$`, and `Benchmark`, then matches names with `str::contains` rather than full regular expressions.
+- `-bench` strips leading `^`, trailing `$`, and `Benchmark`, then matches names with `str::contains` or exact equality under `--exact`, rather than full regular expressions. `--skip` excludes matching substrings.
 - `-cpu N` sets the `-N` suffix on `BenchmarkFoo-N` lines rather than sweeping a comma-separated thread list or tuning a runtime scheduler.
-- `CountingAlloc` tracks `B/op` and `allocs/op` counters on the calling thread only, although `-memprofile` samples heap allocations across threads active during `keep_running()`.
-- Benchmarks register flat names on `Suite::bench` such as `"Decode/case=1kb"` rather than nesting `b.Run` sub-closures, and `Bencher` does not yet expose `StopTimer` / `StartTimer` or custom `ReportMetric` units.
+- `CountingAlloc` tracks `B/op` and `allocs/op` on the calling thread without atomic contention, while `ProcessAlloc` aggregates `B/op` and `allocs/op` across all threads for multi-threaded benchmarks; `-memprofile` samples heap allocations across active threads during `keep_running()` with either allocator.
+- Benchmarks register flat names on `Suite::bench` such as `"Decode/case=1kb"` rather than nesting `b.Run` sub-closures, and `Bencher` exposes `reset_timer()` for one-time setup before the loop rather than per-iteration `StopTimer` / `StartTimer` or custom `ReportMetric` units.
 
 ### License
 

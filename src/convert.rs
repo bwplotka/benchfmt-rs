@@ -93,6 +93,7 @@ pub fn convert_criterion_dir(
                 tp.get("Bytes")
                     .or_else(|| tp.get("BytesDecimal"))
                     .and_then(|n| n.as_f64())
+                    .filter(|&n| n.is_finite() && n > 0.0)
                     .map(|n| n as u64)
             });
 
@@ -110,7 +111,7 @@ pub fn convert_criterion_dir(
             .iter()
             .zip(times.iter())
             .filter_map(|(i, t)| Some((i.as_f64()?, t.as_f64()?)))
-            .filter(|&(i, t)| i > 0.0 && t >= 0.0)
+            .filter(|&(i, t)| i.is_finite() && t.is_finite() && i > 0.0 && t >= 0.0)
             .collect();
         if pairs.is_empty() {
             continue;
@@ -129,10 +130,13 @@ pub fn convert_criterion_dir(
             let slice = &pairs[start..end];
             let sum_iters: f64 = slice.iter().map(|(i, _)| *i).sum();
             let sum_ns: f64 = slice.iter().map(|(_, t)| *t).sum();
-            if sum_iters <= 0.0 {
+            if !sum_iters.is_finite() || !sum_ns.is_finite() || sum_iters <= 0.0 {
                 continue;
             }
             let ns_per_op = sum_ns / sum_iters;
+            if !ns_per_op.is_finite() || ns_per_op < 0.0 {
+                continue;
+            }
             let mb_per_sec = bytes_per_op.and_then(|b| {
                 if sum_ns > 0.0 {
                     // Match Go testing.B: decimal MB/s = (bytes * iters / 1e6) / (ns / 1e9).
@@ -144,7 +148,7 @@ pub fn convert_criterion_dir(
             let rec = BenchRecord {
                 name: &name,
                 cpu_procs: opts.cpu_procs,
-                iterations: sum_iters.round() as u64,
+                iterations: (sum_iters.round() as u64).clamp(1, i64::MAX as u64),
                 ns_per_op,
                 mb_per_sec,
                 alloc_bytes_per_op: None,
@@ -164,25 +168,21 @@ fn collect_criterion_benchmarks(
     baseline: &str,
     out: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        // Do not follow directory symlinks so symlink loops cannot cause unbounded recursion.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            if path.file_name().and_then(|s| s.to_str()) == Some(baseline) {
-                let candidate = path.join("benchmark.json");
-                if candidate.is_file() {
-                    out.push(candidate);
-                    continue;
-                }
-            }
-            // Skip Criterion's internal `report` directory to avoid unnecessary traversal.
-            if path.file_name().and_then(|s| s.to_str()) != Some("report") {
-                collect_criterion_benchmarks(&path, baseline, out)?;
+        if path.file_name().and_then(|s| s.to_str()) == Some(baseline) {
+            let candidate = path.join("benchmark.json");
+            if candidate.is_file() {
+                out.push(candidate);
+                continue;
             }
         }
+        collect_criterion_benchmarks(&path, baseline, out)?;
     }
     Ok(())
 }
@@ -215,13 +215,17 @@ pub fn convert_libtest_output(
         let Ok(ns_per_op) = cleaned_ns.parse::<f64>() else {
             continue;
         };
+        if !ns_per_op.is_finite() || ns_per_op < 0.0 {
+            continue;
+        }
         let mb_per_sec = after_ns
             .split_once('=')
             .and_then(|(_, rhs)| rhs.trim().strip_suffix("MB/s"))
             .and_then(|s| {
                 let cleaned: String = s.trim().chars().filter(|&c| c != ',').collect();
                 cleaned.parse::<f64>().ok()
-            });
+            })
+            .filter(|&v| v.is_finite() && v > 0.0);
 
         let rec = BenchRecord {
             name: &name,
@@ -238,4 +242,76 @@ pub fn convert_libtest_output(
 
     writeln!(out, "PASS")?;
     Ok(emitted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn criterion_supports_raw_epochs_bytes_decimal_and_report_named_groups() {
+        let tmp =
+            std::env::temp_dir().join(format!("benchfmt_convert_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        // Benchmark group literally named `report` containing both Criterion's HTML
+        // `report/index.html` and a nested `report/case_1/base` sub-benchmark.
+        let group_dir = tmp.join("report/case_1/base");
+        let html_dir = tmp.join("report");
+        fs::create_dir_all(&group_dir).unwrap();
+        fs::write(html_dir.join("index.html"), "<html></html>").unwrap();
+
+        fs::write(
+            group_dir.join("benchmark.json"),
+            r#"{"full_id":"report/case=1","throughput":{"BytesDecimal":500}}"#,
+        )
+        .unwrap();
+        fs::write(
+            group_dir.join("sample.json"),
+            r#"{"iters":[1.0,2.0,3.0],"times":[10.0,20.0,30.0]}"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&tmp, tmp.join("loop_link")).unwrap();
+
+        let opts = ConvertOptions {
+            header: BenchHeader {
+                goos: "linux".to_owned(),
+                goarch: "amd64".to_owned(),
+                pkg: "pkg".to_owned(),
+                cpu: None,
+                extra: Vec::new(),
+            },
+            cpu_procs: None,
+            criterion_epochs: 0,
+            criterion_baseline: "base".to_owned(),
+        };
+        let mut out = Vec::new();
+        let emitted = convert_criterion_dir(&tmp, &opts, &mut out).unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert_eq!(emitted, 3);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("BenchmarkReport/case=1\t"), "{text}");
+        assert!(text.contains("50000.00 MB/s"), "{text}");
+
+        let missing_err = convert_criterion_dir(&tmp, &opts, Vec::new()).unwrap_err();
+        assert_eq!(missing_err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn libtest_handles_missing_throughput_and_ignores_non_finite_lines() {
+        let sample = "\
+test ok::plain ... bench:       9.50 ns/iter (+/- 0.20)
+test bad::nan ... bench:       NaN ns/iter (+/- 0.00)
+test ok::comma_tp ... bench:   2,000 ns/iter (+/- 10) = 1,234.50 MB/s
+";
+        let mut out = Vec::new();
+        let count = convert_libtest_output(sample, &ConvertOptions::default(), &mut out).unwrap();
+        assert_eq!(count, 2);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("BenchmarkOk::plain"), "{text}");
+        assert!(!text.contains("Bad::nan"), "{text}");
+        assert!(text.contains("1234.50 MB/s"), "{text}");
+    }
 }
