@@ -503,6 +503,15 @@ fn strip_internal_heap_frames(frame_symbols: &mut Vec<(u64, Vec<ResolvedSymbol>)
     }
 }
 
+// NOTE: `backtrace::resolve` subtracts 1 from `addr` on `gimli` targets (`mod.rs` `adjust_ip`),
+// whereas `backtrace`'s Windows MSVC `dbghelp` backend (`dbghelp.rs`) calls `adjust_ip` twice on
+// `ResolveWhat::Address`, subtracting 2. Adding `EXACT_PC_RESOLVE_OFFSET` lands on `addr` itself
+// when resolving a function entry address or an exact interrupted `PC`.
+#[cfg(all(windows, target_env = "msvc", not(target_vendor = "uwp")))]
+const EXACT_PC_RESOLVE_OFFSET: usize = 2;
+#[cfg(not(all(windows, target_env = "msvc", not(target_vendor = "uwp"))))]
+const EXACT_PC_RESOLVE_OFFSET: usize = 1;
+
 fn resolve_return_ip(return_ip: usize, fallback_sym_addr: Option<usize>) -> Vec<ResolvedSymbol> {
     let mut out = Vec::new();
     let collect = |symbol: &backtrace::Symbol, dst: &mut Vec<ResolvedSymbol>| {
@@ -533,11 +542,15 @@ fn resolve_return_ip(return_ip: usize, fallback_sym_addr: Option<usize>) -> Vec<
         && let Some(sym_addr) = fallback_sym_addr
         && sym_addr != 0
     {
-        // `backtrace::resolve` subtracts 1 internally, so pass `sym_addr + 1` to land on the
-        // function's entry byte rather than the last byte of the preceding function.
-        backtrace::resolve(sym_addr.saturating_add(1) as *mut c_void, |sym| {
-            collect(sym, &mut out);
-        });
+        // Offset `sym_addr` by `EXACT_PC_RESOLVE_OFFSET` so `backtrace::resolve`'s internal
+        // return-address decrement lands on the function's entry byte rather than the preceding
+        // function.
+        backtrace::resolve(
+            sym_addr.saturating_add(EXACT_PC_RESOLVE_OFFSET) as *mut c_void,
+            |sym| {
+                collect(sym, &mut out);
+            },
+        );
     }
     out
 }
@@ -692,10 +705,14 @@ impl CpuCollector {
                     continue;
                 }
                 // The single frame unwound across the OS signal trampoline (`__restore_rt`) holds
-                // the exact interrupted `PC` rather than a post-`call` return address; add 1 before
-                // `backtrace::resolve` (which subtracts 1 internally) and store `ip` directly.
+                // the exact interrupted `PC` rather than a post-`call` return address; add
+                // `EXACT_PC_RESOLVE_OFFSET` before `backtrace::resolve` and store `ip` directly.
                 let exact_pc = std::mem::take(&mut next_is_interrupted_pc);
-                let lookup_ip = if exact_pc { ip.saturating_add(1) } else { ip };
+                let lookup_ip = if exact_pc {
+                    ip.saturating_add(EXACT_PC_RESOLVE_OFFSET)
+                } else {
+                    ip
+                };
                 let syms = resolved_cache
                     .entry(lookup_ip)
                     .or_insert_with(|| {
@@ -877,19 +894,52 @@ mod tests {
     }
 
     #[inline(never)]
-    fn interrupted_entry_probe(x: u64) -> u64 {
-        std::hint::black_box(x).wrapping_add(1)
+    fn interrupted_entry_probe(x: u64) -> (u64, usize) {
+        #[cfg(all(windows, target_env = "msvc", not(target_vendor = "uwp")))]
+        let entry = {
+            // Under MSVC `/INCREMENTAL`, a Rust fn pointer can point to an ILT jump thunk rather
+            // than the function body; query `dbghelp` (`SYMBOL_INFOW.Address`) from an active
+            // stack frame so the test always probes the real entry byte.
+            let mut resolved = interrupted_entry_probe as *const () as usize;
+            backtrace::trace(|frame| {
+                let mut found = None;
+                backtrace::resolve_frame(frame, |sym| {
+                    if let Some(name) = sym.name()
+                        && format!("{name:#}").contains("interrupted_entry_probe")
+                        && let Some(addr) = sym.addr()
+                    {
+                        found = Some(addr as usize);
+                    }
+                });
+                if let Some(addr) = found {
+                    resolved = addr;
+                    return false;
+                }
+                true
+            });
+            resolved
+        };
+        #[cfg(not(all(windows, target_env = "msvc", not(target_vendor = "uwp"))))]
+        let entry = interrupted_entry_probe as *const () as usize;
+        (std::hint::black_box(x).wrapping_add(1), entry)
     }
 
     #[test]
-    fn exact_pc_plus_one_resolves_function_entry_byte() {
-        assert_eq!(interrupted_entry_probe(41), 42);
-        let entry_pc = interrupted_entry_probe as *const () as usize;
-        let syms = resolve_return_ip(entry_pc.saturating_add(1), None);
+    fn exact_pc_offset_resolves_function_entry_byte() {
+        let (out, entry_pc) = interrupted_entry_probe(41);
+        assert_eq!(out, 42);
+        let syms = resolve_return_ip(entry_pc.saturating_add(EXACT_PC_RESOLVE_OFFSET), None);
         assert!(
             syms.iter()
                 .any(|s| s.name.contains("interrupted_entry_probe")),
             "expected function entry byte to resolve to interrupted_entry_probe, got {syms:?}"
+        );
+        let fallback_syms = resolve_return_ip(1, Some(entry_pc));
+        assert!(
+            fallback_syms
+                .iter()
+                .any(|s| s.name.contains("interrupted_entry_probe")),
+            "expected fallback_sym_addr to resolve function entry byte, got {fallback_syms:?}"
         );
     }
 }
