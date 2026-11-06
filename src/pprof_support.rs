@@ -561,15 +561,23 @@ fn is_internal_heap_frame(sym: &ResolvedSymbol) -> bool {
     // `<alloc::alloc::Global>::alloc_impl_runtime` and `<std::alloc::System>::alloc_impl` match
     // alongside free functions like `alloc::alloc::alloc`.
     let norm = n.trim_start_matches(['<', '&']);
-    let trimmed = n.trim_start_matches('_');
+    // In Windows CodeView PDBs, `#[global_allocator]` shims lack `DW_AT_linkage_name` and resolve
+    // via their parent module path (`<crate>::_::__rust_alloc` or `<crate>::_::__rg_alloc`) rather
+    // than `__rustc::__rust_alloc`. Require a leading `_` on the leaf identifier so user functions
+    // named `rust_alloc*` are never stripped.
+    let raw_leaf = n.rsplit("::").next().unwrap_or(n);
+    let is_compiler_alloc_shim = raw_leaf.starts_with('_') && {
+        let leaf = raw_leaf.trim_start_matches('_');
+        leaf.starts_with("rust_alloc")
+            || leaf.starts_with("rust_realloc")
+            || leaf.starts_with("rg_alloc")
+            || leaf.starts_with("rg_realloc")
+    };
     norm.starts_with("backtrace::")
         || norm.starts_with("benchfmt::pprof_support::")
         || norm.starts_with("benchfmt::alloc::")
         || n.starts_with("__rustc::__rust_")
-        || trimmed.starts_with("rust_alloc")
-        || trimmed.starts_with("rust_realloc")
-        || trimmed.starts_with("rg_alloc")
-        || trimmed.starts_with("rg_realloc")
+        || is_compiler_alloc_shim
         || norm.starts_with("alloc::alloc::")
         || norm.starts_with("core::alloc::")
         || norm.starts_with("std::alloc::")
@@ -839,6 +847,8 @@ mod tests {
                     "<benchfmt::alloc::CountingAlloc as core::alloc::global::GlobalAlloc>::alloc",
                 )],
             ),
+            // Windows CodeView PDB `#[global_allocator]` shim scoped under the test crate.
+            (0x1003, vec![mk("pprof::_::__rust_alloc")]),
             // User physical frame where `<alloc::alloc::Global>::alloc_impl_runtime` and
             // `alloc::alloc::alloc` were inlined via `Box::new`.
             (
@@ -849,7 +859,7 @@ mod tests {
                     mk("alloc::alloc::alloc"),
                     mk("alloc::alloc::exchange_malloc"),
                     mk("alloc::boxed::Box<T>::new"),
-                    mk("my_crate::my_box_alloc_fn"),
+                    mk("my_crate::rust_alloc_benchmark"),
                 ],
             ),
             (0x3000, vec![mk("my_crate::caller")]),
@@ -860,7 +870,7 @@ mod tests {
         assert_eq!(frames[0].0, 0x2000);
         assert_eq!(frames[0].1.len(), 2);
         assert_eq!(frames[0].1[0].name, "alloc::boxed::Box<T>::new");
-        assert_eq!(frames[0].1[1].name, "my_crate::my_box_alloc_fn");
+        assert_eq!(frames[0].1[1].name, "my_crate::rust_alloc_benchmark");
 
         // Unsymbolicated leaf frame directly preceding a mixed inline user frame is drained.
         let mut unsym_before_mixed = vec![
